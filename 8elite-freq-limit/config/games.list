@@ -1,0 +1,30 @@
+# 游戏名单：命中则用 game 档，否则 daily 档
+# 一行一个包名，# 开头为注释
+com.miHoYo.Yuanshen
+com.miHoYo.hkrpg
+com.miHoYo.Nap
+com.miHoYo.zenless
+com.tencent.tmgp.sgame
+com.tencent.tmgp.pubgmhd
+com.tencent.lolm
+com.tencent.tmgp.cod
+com.tencent.tmgp.dfm
+com.tencent.tmgp.cf
+com.tencent.tmgp.speedmobile
+com.netease.l22
+com.netease.moba
+com.netease.party
+com.netease.dwrg
+com.netease.hyxd
+com.kurogame.mingchao
+com.kurogame.haru
+com.hypergryph.arknights
+com.hypergryph.endfield
+com.mojang.minecraftpe
+com.roblox.client
+com.supercell.clashofclans
+com.supercell.clashroyale
+com.supercell.brawlstars
+com.riotgames.league.wildrift
+com.garena.game.codm
+com.pubg

@@ -1,0 +1,9 @@
+#!/sbin/sh
+umask 022
+OUTFD=$2
+ZIPFILE=$3
+mkdir -p /dev/tmp
+cd /dev/tmp
+rm -rf META-INF
+unzip -o "$ZIPFILE" 'META-INF/*' >/dev/null 2>&1
+. ./META-INF/com/google/android/updater-script
