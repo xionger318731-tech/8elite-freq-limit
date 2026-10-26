@@ -1,28 +1,40 @@
 #!/system/bin/sh
 # ============================================================
-# 8elite限频 —— 核心守护 v1.0
+# 8elite限频 —— 核心守护 V2.0
 #
-# 【设计依据：全部来自本机实测】
-#   time_in_state：16 档，单位 10ms，只统计 policy 首核（CPU0）
-#   微信前台不干预时有效频率：0.78 ~ 1.03 GHz
-#   冷启动拐点：2.4G=455ms(无损) 2.0G=536ms 1.78G=584ms 1.15G=678ms
-#   静止锁 748M：电流 150mA（官方 395mA）
+# 【V1.0 的根本缺陷（已修复）】
 #
-# 【核心算法】
-#   天花板 = 实际需求 × 余量，每 500ms 跟随一次
-#     idle   需求 < 阈值持续 2s      → 锁 748800
-#     boost  需求 ≥ 天花板 92%       → 阶梯升 2 档
-#     rich   需求 < 天花板 72% 持续 1s → 降到 需求×余量
-#     hold   中间地带                → 保持
-#     launch 前台切换 15s 内         → 锁 2.4G（无损点）
-#     game   游戏前台                → 不干预
+#   V1.0 用「有效频率 vs 天花板」判断需求。
+#   致命问题：压到 748800 后，CPU 满载也只能跑 748800，
+#   有效频率 = 748800，占比 = 100%。
+#   空载和满载看起来一样，无法区分真实需求。
 #
-# 【性能优化】
-#   1. 前台检测 1s 一次（原 250ms）→ 省 75% dumpsys
-#   2. 频率表缓存到变量，循环内零 cat
-#   3. 状态文件 1s 写一次
-#   4. 只在状态变化时写 cooling 节点
-#   5. 目标：< 0.15% 系统 CPU
+#   实测证据：
+#     压到 748800 后，空载/单核满载/8核满载 的撞顶率都是 100%
+#     → 频率信号在被限制后完全失效
+#
+# 【V2.0 的判据：CPU 使用率】
+#
+#   CPU 使用率是「时间维度」的，不受频率限制影响。
+#   实测（不同上限下 8 核满载）：
+#     state=0  上限 2227200 → 使用率 100%
+#     state=8  上限 1785600 → 使用率 100%
+#     state=13 上限 748800  → 使用率 100%
+#   恒定！所以能准确反映「有多少活要干」。
+#
+# 【算法】
+#
+#   load > HIGH(85%)  → 算力紧张，阶梯升 2 档
+#   load < LOW(55%)   → 有余力，降一档
+#   中间              → 保持
+#
+#   响应速度：250ms 采样，500ms 判定
+#
+# 【额外保护】
+#   · 冷启动 15s 锁 2.4G（实测无损点）
+#   · 游戏前台不干预
+#   · 熄屏交还官方
+#   · 温度 >72°C 交还官方
 # ============================================================
 
 D=/data/adb/eta_sched
@@ -34,24 +46,23 @@ THERMAL=/sys/class/thermal
 MSM=/sys/kernel/msm_performance/parameters/cpu_max_freq
 
 # ---------- 调参 ----------
-TICK_MS=1000             # 主循环（1s，采样精度足够）
-FG_TICK=1                # 每轮查前台（1s）
-STATE_TICK=1             # 每轮写状态（1s）
-CFG_TICK=5                # 每 5 轮重载配置（5s）
+TICK_MS=200              # 采样周期（200ms）
+FG_TICK=5                # 每 5 轮查前台（1s）
+STATE_TICK=5             # 每 5 轮写状态（1s）
+CFG_TICK=25              # 每 25 轮重载配置（5s）
 
-MARGIN_PCT=112
-RICH_RATIO=72
-NEAR_RATIO=92
-IDLE_FREQ=1100000
-IDLE_CONFIRM=2           # 连续 2 次（2s）
-BOOST_STEP=2
+HIGH_LOAD=85             # 使用率 > 此值 → 升档
+LOW_LOAD=55              # 使用率 < 此值 → 降档
+UP_CONFIRM=2             # 升档连续确认
+DOWN_CONFIRM=10          # 降档累积确认
+BOOST_STEP=2             # 每次升 2 档
 
 FLOOR_BIG=748800
 FLOOR_PRIME=1017600
-PRIME_TRIGGER=2200000
-LAUNCH_CAP_B=2400000
+PRIME_TRIGGER=1800000    # 大核到多少让超大核介入
+LAUNCH_CAP_B=2400000     # 冷启动锁 2.4G（实测无损点）
 LAUNCH_CAP_P=2200000
-APP_SKIP_MS=15000
+APP_SKIP_MS=15000         # 冷启动保护 15s
 T_HARD=72000
 BOOT_SKIP=60
 
@@ -63,12 +74,12 @@ ENABLED=1
 
 CUR_STB=0; CUR_STP=0
 CAP_B=0; CAP_P=0
-RICH=0; IDLE=0
+UP_CNT=0; DOWN_CNT=0
 FG=""; FG_TS=0
 BOOT_TS=0
 TICK=0
 
-SCENE=""; EFF_B=0; EFF_P=0; RATIO=0; TB=0
+SCENE=""; LOAD=0; LOAD_P=0; TB=0
 OFF_B=3532800; OFF_P=4320000
 FREQ_B=""; FREQ_P=""
 
@@ -76,7 +87,7 @@ log(){ echo "$(date '+%m-%d %H:%M:%S') $*" >> "$OBS/daemon.log"; }
 
 # ============================================================
 find_paths(){
-    local d rc c t
+    local d rc t
     POL_B=""; POL_P=""
     for d in $CPUFREQ/policy*/; do
         [ -d "$d" ] || continue
@@ -98,14 +109,13 @@ find_paths(){
     done
     [ -z "$CD_B" ] && CD_B="$THERMAL/cooling_device3"
     [ -z "$CD_P" ] && CD_P="$THERMAL/cooling_device4"
-    # 缓存频率表
     FREQ_B=$(cat "$POL_B/scaling_available_frequencies" 2>/dev/null)
     FREQ_P=$(cat "$POL_P/scaling_available_frequencies" 2>/dev/null)
 }
 
 load_cfg(){
     [ -f "$CFG" ] || return 0
-    local k v om="" oi="" orr="" on="" op=""
+    local k v om="" ohi="" olo="" op=""
     while IFS='=' read -r k v; do
         case "$k" in ''|'#'*) continue ;; esac
         v=$(printf '%s' "$v" | tr -d ' \t\r')
@@ -113,35 +123,27 @@ load_cfg(){
             mode) MODE=$v ;;
             style) STYLE=$v ;;
             enabled) ENABLED=$v ;;
-            margin) MARGIN_PCT=$v; om=1 ;;
-            idle_freq) IDLE_FREQ=$v; oi=1 ;;
-            rich_ratio) RICH_RATIO=$v; orr=1 ;;
-            near_ratio) NEAR_RATIO=$v; on=1 ;;
+            high_load) HIGH_LOAD=$v; ohi=1 ;;
+            low_load) LOW_LOAD=$v; olo=1 ;;
             prime_trigger) PRIME_TRIGGER=$v; op=1 ;;
         esac
     done < "$CFG"
 
     case "$STYLE" in
         eco)
-            [ -z "$om" ] && MARGIN_PCT=105
-            [ -z "$oi" ] && IDLE_FREQ=1300000
-            [ -z "$orr" ] && RICH_RATIO=80
-            [ -z "$on" ] && NEAR_RATIO=95
-            [ -z "$op" ] && PRIME_TRIGGER=2800000
+            [ -z "$ohi" ] && HIGH_LOAD=90
+            [ -z "$olo" ] && LOW_LOAD=65
+            [ -z "$op" ] && PRIME_TRIGGER=2200000
             ;;
         perf)
-            [ -z "$om" ] && MARGIN_PCT=135
-            [ -z "$oi" ] && IDLE_FREQ=800000
-            [ -z "$orr" ] && RICH_RATIO=55
-            [ -z "$on" ] && NEAR_RATIO=85
+            [ -z "$ohi" ] && HIGH_LOAD=75
+            [ -z "$olo" ] && LOW_LOAD=45
             [ -z "$op" ] && PRIME_TRIGGER=1500000
             ;;
         *)
-            [ -z "$om" ] && MARGIN_PCT=112
-            [ -z "$oi" ] && IDLE_FREQ=1100000
-            [ -z "$orr" ] && RICH_RATIO=72
-            [ -z "$on" ] && NEAR_RATIO=92
-            [ -z "$op" ] && PRIME_TRIGGER=2200000
+            [ -z "$ohi" ] && HIGH_LOAD=85
+            [ -z "$olo" ] && LOW_LOAD=55
+            [ -z "$op" ] && PRIME_TRIGGER=1800000
             ;;
     esac
 }
@@ -197,23 +199,20 @@ is_game(){
     return 1
 }
 
-eff_freq(){
-    [ -f "$1" ] && [ -f "$2" ] || { printf '0'; return; }
-    awk '
-    NR==FNR { a[FNR]=$2; n=FNR; next }
-    {
-        # 行数不匹配或缺失基线 → 跳过该行
-        if (FNR > n || !(FNR in a)) next
-        d = $2 - a[FNR]
-        if (d < 0) d = 0
-        s += d
-        w += $1 * d
-    }
-    END { if (s > 0) printf "%d", w/s; else print 0 }
-    ' "$1" "$2" 2>/dev/null
+# ---------- CPU 使用率（核心判据）----------
+# 一次读 /proc/stat，输出整数百分比
+# 注意：用 awk 单次调用，避免多次 fork
+snap_stat(){ awk '/^cpu /{print $2,$3,$4,$5,$6,$7,$8,$9; exit}' /proc/stat; }
+
+calc_load(){
+    # $1 = 上一轮快照, $2 = 本轮快照
+    echo "$1 $2" | awk '{
+        busy=($9-$1)+($10-$2)+($11-$3)+($14-$6)+($15-$7)+($16-$8)
+        idle=($12-$4)+($13-$5)
+        if(busy+idle>0) printf "%d", busy*100/(busy+idle)
+        else print 0
+    }'
 }
-
-
 
 snap_freq(){
     local which="$1" t="$2" best=0 f list
@@ -244,6 +243,28 @@ step_up(){
     done
     printf '%s' "$cur"
 }
+
+step_down(){
+    local which="$1" cur="$2" n="$3" f list idx=0 tot=0 cnt=0 floor
+    if [ "$which" = "B" ]; then list="$FREQ_B"; floor=$FLOOR_BIG; else list="$FREQ_P"; floor=$FLOOR_PRIME; fi
+    for f in $list; do
+        tot=$((tot+1))
+        case "$f" in ''|*[!0-9]*) continue ;; esac
+        [ "$f" -le "$cur" ] && idx=$tot
+    done
+    local tgt=$((idx-n))
+    [ "$tgt" -lt 1 ] && tgt=1
+    for f in $list; do
+        cnt=$((cnt+1))
+        [ "$cnt" -eq "$tgt" ] && {
+            # 不能低于地板
+            if [ "$f" -lt "$floor" ]; then printf '%s' "$floor"; else printf '%s' "$f"; fi
+            return
+        }
+    done
+    printf '%s' "$cur"
+}
+
 
 state_for(){
     local map="$1" t="$2" st f best=0 bf=-1
@@ -285,27 +306,27 @@ write_state(){
         echo "style=$STYLE"
         echo "scene=$SCENE"
         echo "fg=$FG"
+        echo "load=$LOAD"
         echo "cap_big=$CAP_B"
         echo "cap_prime=$CAP_P"
-        echo "eff_big=$EFF_B"
-        echo "eff_prime=$EFF_P"
-        echo "ratio_big=$RATIO"
         echo "off_big=$OFF_B"
         echo "off_prime=$OFF_P"
         echo "st_big=$CUR_STB"
         echo "st_prime=$CUR_STP"
         echo "temp_big=$TB"
+        echo "up_cnt=$UP_CNT"
+        echo "down_cnt=$DOWN_CNT"
         echo "ts=$(date +%s)"
     } > "$OBS/state.tmp" 2>/dev/null && mv "$OBS/state.tmp" "$OBS/state" 2>/dev/null
 }
 
-# 跳过本轮：刷新快照 + 可选写状态
 skip_round(){
     SCENE="$1"
-    cat "$POL_B/stats/time_in_state" > /tmp/ti_b.1 2>/dev/null
-    cat "$POL_P/stats/time_in_state" > /tmp/ti_p.1 2>/dev/null
+    # 注意：不重置 STAT_PREV！
+    # 负载计算必须基于连续采样，重置会导致窗口变成"刚重置的瞬间"
     [ $((TICK % STATE_TICK)) -eq 0 ] && write_state
 }
+
 
 cleanup(){
     [ "$RUN" = "0" ] && return
@@ -333,10 +354,9 @@ echo $$ > "$OBS/daemon.pid"
 
 BOOT_TS=$(date +%s)
 trap cleanup TERM INT EXIT
-log "启动 v1.0 pid=$$ style=$STYLE"
+log "启动 V2.0 pid=$$ style=$STYLE"
 
-cat "$POL_B/stats/time_in_state" > /tmp/ti_b.1 2>/dev/null
-cat "$POL_P/stats/time_in_state" > /tmp/ti_p.1 2>/dev/null
+STAT_PREV=$(snap_stat)
 
 while [ "$RUN" = "1" ]; do
     usleep $((TICK_MS * 1000))
@@ -346,14 +366,14 @@ while [ "$RUN" = "1" ]; do
 
     # 熄屏
     if [ "$(screen_on)" = "0" ]; then
-        release; CAP_B=0; CAP_P=0; RICH=0; IDLE=0
+        release; CAP_B=0; CAP_P=0; UP_CNT=0; DOWN_CNT=0
         skip_round "off"
         continue
     fi
 
     # 关闭
     if [ "$ENABLED" != "1" ] || [ "$MODE" != "auto" ]; then
-        release; CAP_B=0; CAP_P=0
+        release; CAP_B=0; CAP_P=0; UP_CNT=0; DOWN_CNT=0
         skip_round "disabled"
         continue
     fi
@@ -363,16 +383,16 @@ while [ "$RUN" = "1" ]; do
     # 开机保护
     NOW_S=$(date +%s)
     if [ $((NOW_S - BOOT_TS)) -lt "$BOOT_SKIP" ]; then
-        release; CAP_B=0; CAP_P=0
+        release; CAP_B=0; CAP_P=0; UP_CNT=0; DOWN_CNT=0
         skip_round "boot"
         continue
     fi
 
-    # 温度硬墙
+    # 温度
     TB=$(cat "$THERMAL/thermal_zone1/temp" 2>/dev/null)
     case "$TB" in ''|*[!0-9]*) TB=0 ;; esac
     if [ "$TB" -ge "$T_HARD" ]; then
-        release; CAP_B=0; CAP_P=0; RICH=0; IDLE=0
+        release; CAP_B=0; CAP_P=0; UP_CNT=0; DOWN_CNT=0
         skip_round "hot"
         continue
     fi
@@ -388,89 +408,143 @@ while [ "$RUN" = "1" ]; do
 
     # 游戏
     if [ -n "$FG" ] && is_game "$FG"; then
-        release; CAP_B=0; CAP_P=0
+        release; CAP_B=0; CAP_P=0; UP_CNT=0; DOWN_CNT=0
         skip_round "game"
         continue
     fi
 
-    # 冷启动保护：锁 2.4G
+    # 冷启动保护
     NOWMS=$(date +%s%3N)
     if [ $((NOWMS - FG_TS)) -lt "$APP_SKIP_MS" ]; then
         CAP_B=$LAUNCH_CAP_B; CAP_P=$LAUNCH_CAP_P
         apply "$CAP_B" "$CAP_P"
+        UP_CNT=0; DOWN_CNT=0
         skip_round "launch"
         continue
     fi
 
-    # 采样
-    cat "$POL_B/stats/time_in_state" > /tmp/ti_b.2 2>/dev/null
-    cat "$POL_P/stats/time_in_state" > /tmp/ti_p.2 2>/dev/null
-    EFF_B=$(eff_freq /tmp/ti_b.1 /tmp/ti_b.2)
-    EFF_P=$(eff_freq /tmp/ti_p.1 /tmp/ti_p.2)
-    case "$EFF_B" in ''|*[!0-9]*) EFF_B=0 ;; esac
-    case "$EFF_P" in ''|*[!0-9]*) EFF_P=0 ;; esac
+    # ---------- 核心：CPU 使用率 ----------
+    STAT_NOW=$(snap_stat)
+    LOAD=$(calc_load "$STAT_PREV" "$STAT_NOW")
+    case "$LOAD" in ''|*[!0-9]*) LOAD=0 ;; esac
+    STAT_PREV="$STAT_NOW"
 
-    CM=$(cat "$POL_B/scaling_max_freq" 2>/dev/null)
-    case "$CM" in ''|*[!0-9]*) CM=$OFF_B ;; esac
-    RATIO=0
-    [ "$CM" -gt 0 ] && RATIO=$(( EFF_B * 100 / CM ))
-
-    # 决策
-    if [ "$EFF_B" -lt "$IDLE_FREQ" ]; then
-        IDLE=$((IDLE+1))
+    # 关键：CAP_B 必须与实际值同步，否则会基于过期缓存做决策
+    CUR_MAX=$(cat "$POL_B/scaling_max_freq" 2>/dev/null)
+    case "$CUR_MAX" in ''|*[!0-9]*) CUR_MAX=$OFF_B ;; esac
+    # 如果实际值 >= 官方天花板，说明我们没在压（让路状态）
+    if [ "$CUR_MAX" -ge "$OFF_B" ]; then
+        CAP_B=0
     else
-        IDLE=0
+        CAP_B=$CUR_MAX
     fi
 
-    if [ "$IDLE" -ge "$IDLE_CONFIRM" ]; then
-        SCENE="idle"
-        CAP_B=$FLOOR_BIG; CAP_P=$FLOOR_PRIME; RICH=0
-    elif [ "$RATIO" -ge "$NEAR_RATIO" ]; then
-        SCENE="boost"
-        if [ "$CAP_B" -le 0 ]; then
-            CAP_B=$(step_up B "$FLOOR_BIG" "$BOOST_STEP")
+    # ---------- 决策：用使用率直接换算目标频率 ----------
+    #
+    # 原理：CPU 使用率反映「有多少活」
+    #   使用率 100% → 活干不完，需要更多频率
+    #   使用率 50%  → 正好一半时间在跑，频率够用
+    #
+    # 目标频率 = 当前频率 × (使用率 / 目标使用率)
+    #   目标使用率 = 70%（留 30% 余量应对突发）
+    #
+    # 例：当前 748800，使用率 100%
+    #     → 目标 = 748800 × (100/70) = 1069714 → 对齐 960000
+    #   例：当前 1785600，使用率 40%
+    #     → 目标 = 1785600 × (40/70) = 1020342 → 对齐 960000
+    #
+    # 这样一次就能算出合适值，不用逐档试探
+
+    CUR_MAX=$(cat "$POL_B/scaling_max_freq" 2>/dev/null)
+    case "$CUR_MAX" in ''|*[!0-9]*) CUR_MAX=$OFF_B ;; esac
+
+    # 关键公式：NEW_CAP = CUR_MAX × (LOAD / TARGET)^2
+    #
+    # 为什么用平方：
+    #   LOAD=100%, TARGET=70 → (100/70)^2 = 2.04 → 翻倍（饱和说明严重不足）
+    #   LOAD=70%,  TARGET=70 → 1.0 → 不变（正好）
+    #   LOAD=50%,  TARGET=70 → 0.51 → 减半（一半时间闲着）
+    #
+    # 线性公式的问题是：饱和时只升 1.4 倍，不够
+
+    TARGET_LOAD=70
+
+    if [ "$LOAD" -gt 0 ]; then
+        # 先算比例，再平方（用整数运算放大精度）
+        RATIO=$(( LOAD * 100 / TARGET_LOAD ))       # 例如 142 = 1.42x
+        NEW_CAP=$(( CUR_MAX * RATIO / 100 * RATIO / 100 ))
+    else
+        NEW_CAP=$(( CUR_MAX / 4 ))
+    fi
+
+    # 限幅：单次 0.4x ~ 2.5x
+    MAX_STEP=$(( CUR_MAX * 25 / 10 ))
+    MIN_STEP=$(( CUR_MAX * 4 / 10 ))
+    [ "$NEW_CAP" -gt "$MAX_STEP" ] && NEW_CAP=$MAX_STEP
+    [ "$NEW_CAP" -lt "$MIN_STEP" ] && NEW_CAP=$MIN_STEP
+
+    # 对齐到真实频点
+    NEW_CAP=$(snap_freq B "$NEW_CAP")
+
+    # 只在偏离当前值足够大时才调整（死区，防抖）
+    DIFF=$(( NEW_CAP - CUR_MAX ))
+    [ "$DIFF" -lt 0 ] && DIFF=$(( -DIFF ))
+    DEAD_ZONE=$(( CUR_MAX * 12 / 100 ))    # 12% 死区
+
+    if [ "$DIFF" -ge "$DEAD_ZONE" ]; then
+        if [ "$NEW_CAP" -gt "$CUR_MAX" ]; then
+            # 升档：立即执行（防卡优先）
+            CAP_B=$NEW_CAP
+            UP_CNT=0
+            DOWN_CNT=0
+            SCENE="boost"
         else
-            CAP_B=$(step_up B "$CAP_B" "$BOOST_STEP")
-        fi
-        REQ=$(( EFF_B * MARGIN_PCT / 100 ))
-        [ "$REQ" -gt "$CAP_B" ] && CAP_B=$(snap_freq B "$REQ")
-        [ "$CAP_B" -gt "$OFF_B" ] && CAP_B=$OFF_B
-        RICH=0
-    elif [ "$RATIO" -lt "$RICH_RATIO" ]; then
-        SCENE="rich"
-        RICH=$((RICH+1))
-        if [ "$RICH" -ge 2 ]; then
-            REQ=$(( EFF_B * MARGIN_PCT / 100 ))
-            [ "$REQ" -lt "$FLOOR_BIG" ] && REQ=$FLOOR_BIG
-            CAP_B=$(snap_freq B "$REQ")
-            RICH=2
+            # 降档：累积 8 次确认（不要求连续，因为负载有波动）
+            DOWN_CNT=$((DOWN_CNT+1))
+            UP_CNT=0
+            if [ "$DOWN_CNT" -ge 8 ]; then
+                CAP_B=$NEW_CAP
+                DOWN_CNT=0
+                SCENE="rich"
+            else
+                SCENE="rich_wait"
+                CAP_B=$CUR_MAX
+            fi
         fi
     else
+        # 死区内：保持，但不重置降档计数（允许累积）
         SCENE="hold"
-        RICH=0
-        if [ "$CAP_B" -le 0 ]; then
-            REQ=$(( EFF_B * MARGIN_PCT / 100 ))
-            CAP_B=$(snap_freq B "$REQ")
+        UP_CNT=0
+        if [ "$DOWN_CNT" -gt 0 ] && [ "$LOAD" -gt "$TARGET_LOAD" ]; then
+            # 负载回升到目标以上，才清零降档计数
+            DOWN_CNT=0
         fi
+        CAP_B=$CUR_MAX
     fi
+
+
+
 
     # 超大核
     if [ "$STYLE" = "eco" ]; then
         CAP_P=$FLOOR_PRIME
-    elif [ "$EFF_B" -ge "$PRIME_TRIGGER" ]; then
-        CAP_P=$OFF_P
     else
-        CAP_P=$FLOOR_PRIME
+        # 按使用率决定：高负载时给满
+        if [ "$LOAD" -ge "$HIGH_LOAD" ]; then
+            CAP_P=$OFF_P
+        elif [ "$CAP_B" -ge "$PRIME_TRIGGER" ]; then
+            CAP_P=$OFF_P
+        else
+            CAP_P=$FLOOR_PRIME
+        fi
     fi
 
+    # 地板
     [ "$CAP_B" -gt 0 ] && [ "$CAP_B" -lt "$FLOOR_BIG" ] && CAP_B=$FLOOR_BIG
     [ "$CAP_P" -gt 0 ] && [ "$CAP_P" -lt "$FLOOR_PRIME" ] && CAP_P=$FLOOR_PRIME
 
     apply "$CAP_B" "$CAP_P"
     [ $((TICK % STATE_TICK)) -eq 0 ] && write_state
-
-    mv -f /tmp/ti_b.2 /tmp/ti_b.1 2>/dev/null
-    mv -f /tmp/ti_p.2 /tmp/ti_p.1 2>/dev/null
 done
 
 cleanup
