@@ -1,6 +1,6 @@
 id=eta_sched
 name=8elite限频
-version=V1.2
-versionCode=120
+version=V1.2fix
+versionCode=121
 author=罗霄山
-description=动态限频：CPU使用率判据（不受限频影响），平方公式换算目标频率。静止锁748MHz，满载0.5秒内升档。三档风格，卸载零残留。
+description=动态限频：CPU使用率判据，平方公式换算。静止锁748MHz，满载0.5秒升档。卸载自动回归官方调度，实测零残留。
