@@ -1,6 +1,6 @@
 id=eta_sched
 name=8elite限频
-version=V1.0
-versionCode=100
+version=V1.1
+versionCode=110
 author=罗霄山
-description=动态限频：天花板跟随CPU实际需求。静止锁748MHz，冷启动锁2.4G无损点，游戏不干预。三档风格可选，卸载零残留。
+description=动态限频：用CPU使用率判断真实需求（不受限频影响）。静止锁748MHz，满载0.8秒内翻倍升档。三档风格可选，卸载零残留。
