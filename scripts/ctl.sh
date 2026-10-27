@@ -1,6 +1,6 @@
 #!/system/bin/sh
 # ============================================================
-# 8elite限频 控制脚本 v1.0
+# 8elite限频 控制脚本 v1.3
 #   status  状态   start  启动   stop  停止
 #   mode    切换   release 归还  log   日志
 # ============================================================
@@ -11,9 +11,13 @@ CFG=/storage/emulated/0/Android/8elite/config.conf
 CD_B=/sys/class/thermal/cooling_device3/cur_state
 CD_P=/sys/class/thermal/cooling_device4/cur_state
 
+# 辅助：把 kHz 显示成 MHz；0/空 显示“不压/—”
+fmt_mhz(){ case "$1" in ''|*[!0-9]*) echo "—"; return ;; esac; [ "$1" -le 0 ] 2>/dev/null && { echo "不压"; return; }; echo "$(( $1 / 1000 )) MHz"; }
+fmt_temp(){ case "$1" in ''|*[!0-9]*) echo "—"; return ;; esac; echo "$(( $1 / 1000 )).$(( ( $1 % 1000 ) / 100 ))°C"; }
+
 do_status(){
     echo "=============================================================="
-    echo "8elite限频 v1.0"
+    echo "8elite限频 v1.3"
     echo "=============================================================="
 
     local dp=""
@@ -31,25 +35,29 @@ do_status(){
             case "$k" in
                 scene)
                     case "$v" in
-                        idle)     echo "  状态: 静止 → 锁最低频" ;;
-                        boost)    echo "  状态: 需求逼近 → 升档" ;;
-                        rich)     echo "  状态: 需求富余 → 降档" ;;
-                        hold)     echo "  状态: 跟随中" ;;
-                        launch)   echo "  状态: 应用启动 → 锁 2.4G" ;;
-                        game)     echo "  状态: 游戏 → 不干预" ;;
-                        off)      echo "  状态: 熄屏 → 交还官方" ;;
-                        hot)      echo "  状态: 过热 → 交还官方" ;;
-                        boot)     echo "  状态: 开机保护" ;;
-                        disabled) echo "  状态: 已关闭" ;;
-                        *)        echo "  状态: $v" ;;
+                        init)      echo "  状态: 初始化" ;;
+                        disabled)  echo "  状态: 已关闭" ;;
+                        off)       echo "  状态: 熄屏 → 交还官方" ;;
+                        boot)      echo "  状态: 开机保护" ;;
+                        charging)  echo "  状态: 充电 → 放开" ;;
+                        panic)     echo "  状态: 过热 → 让路" ;;
+                        rich_wait) echo "  状态: 升档待确认" ;;
+                        boost)     echo "  状态: 需求逼近 → 升档" ;;
+                        hold)      echo "  状态: 跟随中" ;;
+                        save)      echo "  状态: 富余 → 降档省电" ;;
+                        rich)      echo "  状态: 需求富余" ;;
+                        *)         echo "  状态: $v" ;;
                     esac ;;
-                style)    echo "  风格: $v" ;;
-                fg)       echo "  前台: $v" ;;
-                eff_big)  echo "  需求: $v kHz" ;;
-                cap_big)  echo "  大核天花板: $v kHz" ;;
-                cap_prime) echo "  超核天花板: $v kHz" ;;
-                ratio_big) echo "  占比: $v%" ;;
-                temp_big) echo "  温度: $v" ;;
+                mode)      echo "  模式: $v" ;;
+                style)     echo "  风格: $v" ;;
+                fg)        echo "  前台: $v" ;;
+                need_big)  echo "  需求频率: $(fmt_mhz $v)" ;;
+                cap_big)   echo "  大核天花板: $(fmt_mhz $v)" ;;
+                cap_prime) echo "  超大核天花板: $(fmt_mhz $v)" ;;
+                sat_big)   echo "  撞顶率: $((v/10))%（满 ${v}‰）" ;;
+                target)    echo "  目标占用: ${v}%" ;;
+                power)     echo "  整机功耗: ${v} mW" ;;
+                temp)      echo "  温度: $(fmt_temp $v)" ;;
             esac
         done < "$OBS/state"
     fi
@@ -144,7 +152,7 @@ case "$1" in
     release) do_release ;;
     log)     tail -n "${2:-20}" "$OBS/daemon.log" 2>/dev/null ;;
     *)
-        echo "8elite限频 v1.0"
+        echo "8elite限频 v1.3"
         echo ""
         echo "  status   查看状态"
         echo "  start    启动"

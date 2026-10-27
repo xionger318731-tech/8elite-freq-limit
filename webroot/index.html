@@ -38,7 +38,7 @@ h1{font-size:19px;margin:0 0 4px;font-weight:600}
 .badge.rich{background:rgba(77,159,255,.15);color:var(--accent)}
 .badge.hold{background:rgba(139,147,163,.15);color:var(--dim)}
 .badge.off,.badge.disabled{background:rgba(139,147,163,.15);color:var(--dim)}
-.badge.game,.badge.launch,.badge.hot{background:rgba(255,92,92,.15);color:var(--bad)}
+.badge.panic{background:rgba(255,92,92,.15);color:var(--bad)}
 #toast{position:fixed;left:50%;bottom:30px;transform:translateX(-50%);
   background:rgba(40,44,54,.96);border:1px solid var(--line);padding:10px 18px;
   border-radius:10px;font-size:13px;opacity:0;transition:.25s;pointer-events:none;
@@ -49,17 +49,20 @@ h1{font-size:19px;margin:0 0 4px;font-weight:600}
 <body>
 
 <h1>8elite限频</h1>
-<div class="sub">V1.0 · 天花板跟随实际需求 · 静止锁 748MHz</div>
+<div class="sub">V1.3 · 双判据容积伺服 · 静止锁 748MHz</div>
 
 <div class="card">
   <h2>实时状态</h2>
   <div class="row"><span class="k">服务</span><span class="v" id="svc">—</span></div>
   <div class="row"><span class="k">状态</span><span id="scene">—</span></div>
-  <div class="row"><span class="k">实际需求</span><span class="v" id="effBig">—</span></div>
+  <div class="row"><span class="k">前台</span><span class="v" id="fg">—</span></div>
+  <div class="row"><span class="k">需求频率</span><span class="v" id="needBig">—</span></div>
   <div class="row"><span class="k">大核天花板</span><span class="v" id="capBig">—</span></div>
   <div class="row"><span class="k">超大核天花板</span><span class="v" id="capPrime">—</span></div>
-  <div class="row"><span class="k">需求占比</span><span class="v" id="ratio">—</span></div>
-  <div class="row"><span class="k">大核温度</span><span class="v" id="temp">—</span></div>
+  <div class="row"><span class="k">撞顶率</span><span class="v" id="sat">—</span></div>
+  <div class="row"><span class="k">温度</span><span class="v" id="temp">—</span></div>
+  <div class="row"><span class="k">整机功耗</span><span class="v" id="power">—</span></div>
+  <div class="row"><span class="k">目标占用</span><span class="v" id="target">—</span></div>
 </div>
 
 <div class="card">
@@ -70,9 +73,9 @@ h1{font-size:19px;margin:0 0 4px;font-weight:600}
     <button id="btnPerf" onclick="setStyle('perf')">流畅</button>
   </div>
   <div class="hint">
-    <b>省电</b>：余量 5%，需求 &lt;1.3G 时锁 748M（实测省电 62%，冷启动 431ms）<br>
-    <b>均衡</b>：余量 12%，需求 &lt;1.1G 时锁 748M<br>
-    <b>流畅</b>：余量 35%，需求 &lt;800M 时才锁最低
+    <b>省电</b>：目标占用基准 -5%，更激进限频（最省电）<br>
+    <b>均衡</b>：基准不变，折中<br>
+    <b>流畅</b>：目标占用基准 +20%，更宽松（少限频）
   </div>
 </div>
 
@@ -133,15 +136,17 @@ function fmt(v){
 }
 
 const SCENE_MAP={
-  idle:['静止·锁最低','idle'],
-  boost:['需求逼近·升档','boost'],
-  rich:['需求富余·降档','rich'],
-  hold:['跟随中','hold'],
-  game:['游戏·不干预','game'],
-  launch:['应用启动·锁2.4G','launch'],
+  init:['初始化','hold'],
+  disabled:['已关闭','disabled'],
   off:['熄屏·交还官方','off'],
-  hot:['过热保护','hot'],
-  disabled:['已关闭','disabled']
+  boot:['开机保护','hold'],
+  charging:['充电·放开','off'],
+  panic:['过热·让路','hot'],
+  rich_wait:['升档待确认','boost'],
+  boost:['需求逼近·升档','boost'],
+  hold:['跟随中','hold'],
+  save:['富余·降档省电','rich'],
+  rich:['需求富余','rich']
 };
 
 async function refresh(){
@@ -166,16 +171,23 @@ async function refresh(){
     const sc=SCENE_MAP[kv.scene]||[kv.scene||'—','hold'];
     document.getElementById('scene').innerHTML='<span class="badge '+sc[1]+'">'+sc[0]+'</span>';
 
-    document.getElementById('effBig').textContent=fmt(kv.eff_big);
+    document.getElementById('fg').textContent=kv.fg||'—';
+    document.getElementById('needBig').textContent=fmt(kv.need_big);
     document.getElementById('capBig').textContent=fmt(kv.cap_big);
     document.getElementById('capPrime').textContent=fmt(kv.cap_prime);
 
-    const rt=parseInt(kv.ratio_big||0,10);
-    const rtEl=document.getElementById('ratio');
-    rtEl.textContent=rt+'%';
-    rtEl.className='v '+(rt>=90?'warn':(rt<60?'good':''));
+    const sat=parseInt(kv.sat_big||0,10);
+    const satEl=document.getElementById('sat');
+    satEl.textContent=(sat/10).toFixed(1)+'%';
+    satEl.className='v '+(sat>=300?'bad':(sat<60?'good':''));
 
-    document.getElementById('temp').textContent=kv.temp_big?((kv.temp_big/1000).toFixed(1)+'°C'):'—';
+    document.getElementById('temp').textContent=kv.temp?((kv.temp/1000).toFixed(1)+'°C'):'—';
+
+    const pwr=parseInt(kv.power||0,10);
+    document.getElementById('power').textContent=pwr?pwr+' mW':'—';
+
+    const tgt=parseInt(kv.target||0,10);
+    document.getElementById('target').textContent=tgt?tgt+'%':'—';
 
     // 开关
     const m=kv.mode||'auto';

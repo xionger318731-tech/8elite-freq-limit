@@ -1,6 +1,6 @@
 id=eta_sched
 name=8elite限频
-version=V1.2fix
-versionCode=121
+version=V1.3
+versionCode=130
 author=罗霄山
-description=动态限频：CPU使用率判据，平方公式换算。静止锁748MHz，满载0.5秒升档。卸载自动回归官方调度，实测零残留。
+description=动态限频 V1.3：自研双判据容积伺服（需求密度前馈+撞顶率伺服）+整机功耗外环自整定；触摸/功耗感知、按包学习稳态。静止锁748M，充电自动放开。卸载零残留。

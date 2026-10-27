@@ -35,9 +35,12 @@ while :; do
     fi
 
     # 状态超时（>3 分钟没更新 = 卡死）
+    # 注意：daemon 写入的 ts 是 /proc/uptime 的秒数（零 fork），
+    #       这里必须用同一个时钟，不能用 date +%s（epoch），否则永远超时误杀。
     if [ -f "$OBS/state" ]; then
         ts=$(awk -F= '/^ts=/{print $2}' "$OBS/state" 2>/dev/null)
-        now=$(date +%s)
+        up=$(awk '{print int($1)}' /proc/uptime 2>/dev/null)
+        now=${up:-0}
         case "$ts" in ''|*[!0-9]*) ts=0 ;; esac
         if [ "$ts" -gt 0 ] && [ $((now - ts)) -gt 180 ]; then
             kill -9 "$p" 2>/dev/null
