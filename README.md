@@ -4,14 +4,17 @@
 > KernelSU / APatch · 不改调度器 · 卸载零残留
 
 天花板跟着实际负载走：**CPU 需要多少就给多少 + 一点余量**。
-静止锁 748MHz，需求上来时按需抬到官方上限。
+静止落 748MHz，需求上来时按需抬到 cooling 允许的最高档 3.07GHz。
 
 **V1.3 起控制律整体重写为「双判据容积伺服（DCS）」**——旧版的平方律是乘性随机游走，会被节点回读和 `oiface` 抢写带偏；新版改用绝对量判据 + 不饱和判据。
 
-**V1.4fix 修掉三类致命 bug**（详见 [docs/NOTES.md](docs/NOTES.md) 第九节）：
+**V1.4fix2 修掉一整批致命 bug**（详见 [docs/NOTES.md](docs/NOTES.md) 第九、十节）：
 - 守护进程被 KernelSU 管理器的 app cgroup 冻结 → WebUI 报"服务未运行"、watchdog 反复错杀堆叠实例
 - `map_big.conf` / `map_prime.conf` 是**凭空写的假表**（声称 748800 不存在、超大核压不下去），已按实测重写
-- `/system/bin/sh` 是 32 位算术，频率 × 千分比系数会溢出成负数，满载反而降频
+- `/system/bin/sh` 是 32 位算术：频率乘法溢出、`time_in_state` 加权和溢出（avg 算出 -59kHz）、连大数除法都会截断
+- 功耗读数因防溢出改法过激而恒为 0mW；功耗外环被 `load_cfg` 每 5s 冲掉
+- `state` 镜像同步写 FUSE 阻塞控制循环；`.fg.busy` 残留让前台探测永久停摆
+- 温度单位混淆（整度 vs 毫度）可能误触发 90°C panic
 
 ---
 
@@ -103,7 +106,7 @@ WebUI 里切换。
 
 ## 安装
 
-1. 下载 `8elite_V1.4fix.zip`
+1. 下载 `8elite_V1.4fix2.zip`
 2. KernelSU / APatch 管理器 → 模块 → 从本地安装
 3. 重启
 

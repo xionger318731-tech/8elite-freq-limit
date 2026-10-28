@@ -82,10 +82,15 @@ UP_CONFIRM=2
 DOWN_CONFIRM=8
 UP_RATE=1500          # 单 tick 最大 +50% (x1000)
 DOWN_RATE=750         # 单 tick 最大 -25% (x1000)
-T_SOFT=62000          # m°C
-T_HARD=82000
+# 温度阈值必须对齐本机官方 thermal 的 trip point，否则会误让路。
+# 实测本机 OPPO Find X8 Ultra：
+#   thermal_zone1 (cpu-0-0-0) trip_point = 105000 / 118000 / 120000 / 125000 / 135000
+#   满载压测时 cpu-1-1-1 稳定在 105°C —— 这是**设计工况**，系统自己就按这个跑。
+# 旧值 T_PANIC=90000（90°C）会在满载时直接 release_all，等于满载完全不限频。
+T_SOFT=78000          # m°C  78°C 起软增益（留出爬升余量）
+T_HARD=100000         # m°C  100°C 压到最低增益
 T_MIN_GAIN=550        # x1000
-T_PANIC=90000         # 真危险才彻底让路
+T_PANIC=112000        # m°C  112°C（官方 118/120 之前）才彻底让路
 PWR_BUDGET_DATA=2200  # mW
 PWR_BUDGET_WIFI=2700
 PWR_HYST=250          # mW
@@ -133,6 +138,7 @@ SAT_B=0
 POW=0
 NEED=0
 TB=0
+SKIP_SERVO=0
 STOCK_B=3532800
 STOCK_P=4320000
 CPUS_B="0 1 2 3 4 5"
@@ -270,19 +276,40 @@ load_cfg(){
             launch_ms)          LAUNCH_MS=$v ;;
         esac
     done < "$CFG"
+    # 只有风格 / 目标基准真的变了才重算 TARGET。
+    # 旧实现每次 load_cfg（每 5s）无条件重算，把功耗外环整定出来的 TARGET
+    # 直接冲回基准（45%），外环形同虚设。
+    _stgt=$TARGET_LOAD
     case "$STYLE" in
-        perf)   TARGET=$((TARGET_LOAD + 20)) ;;
-        eco)    TARGET=$((TARGET_LOAD - 5)) ;;
-        *)      TARGET=$TARGET_LOAD ;;
+        perf) _stgt=$((TARGET_LOAD + 20)) ;;
+        eco)  _stgt=$((TARGET_LOAD - 5)) ;;
     esac
-    [ "$TARGET" -lt 35 ] && TARGET=35
-    [ "$TARGET" -gt 85 ] && TARGET=85
+    [ "$_stgt" -lt 35 ] && _stgt=35
+    [ "$_stgt" -gt 85 ] && _stgt=85
+    if [ "${_last_style:-}" != "$STYLE" ]; then
+        TARGET=$_stgt; TARGET_TUNED=0; _last_style=$STYLE
+    elif [ "${TARGET_TUNED:-0}" != 1 ]; then
+        TARGET=$_stgt
+    fi
 }
 # ---------------------------------------------------------------------
 # 前台：异步探测，主循环永不阻塞
 probe_fg(){
-    [ -f "$D/.fg.busy" ] && return
-    : > "$D/.fg.busy"
+    # .fg.busy 是"探测中"标记。若上一个探测进程被 kill -9（或 dumpsys 卡死后
+    # 被 timeout 打死但没来得及清标记），标记会永久残留 -> 前台探测从此停摆，
+    # 游戏 / 冷启动判定全部失效（表现为 games.list 不生效、切应用不抬频）。
+    # 自愈：标记文件里写入 uptime 秒，超过 15s 视为残留并清掉。
+    if [ -f "$D/.fg.busy" ]; then
+        read -r _bt < "$D/.fg.busy" 2>/dev/null
+        case "$_bt" in ''|*[!0-9]*) _bt=0 ;; esac
+        _bnow=$(cut -d. -f1 /proc/uptime 2>/dev/null)
+        case "$_bnow" in ''|*[!0-9]*) _bnow=0 ;; esac
+        if [ "$_bnow" -gt 0 ] && [ $(( _bnow - _bt )) -le 15 ]; then
+            return
+        fi
+        rm -f "$D/.fg.busy" 2>/dev/null
+    fi
+    cut -d. -f1 /proc/uptime > "$D/.fg.busy" 2>/dev/null
     (
         f=$(timeout 3 dumpsys activity activities 2>/dev/null \
             | sed -n 's/.* topResumedActivity[^ ]* u[0-9]* \([a-zA-Z0-9_][a-zA-Z0-9_.]*\)\/.*/\1/p' | head -1)
@@ -410,7 +437,18 @@ read_temp(){
         case "$_rv" in *cpu*|*soc*|*tsens*|*cluster*) ;; *) continue ;; esac
         get "${d}temp" 0; v=$_rv
         [ "$v" -le 0 ] 2>/dev/null && continue
-        [ "$v" -lt 1000 ] && v=$((v * 1000))   # 单位自适应
+        # 单位自适应：本机大多数 zone 是毫度（如 40100 = 40.1°C），
+        # 但 socd 这类 zone 直接给整度（49 = 49°C）。
+        # 旧逻辑 v<1000 才 ×1000，把 49 变成 49000（49°C，恰好正确），
+        # 但如果某个 zone 给 900（=90°C 的整度），会被误当成 0.9°C 再 ×1000
+        # 变成 900000（900°C）→ 误触发 90°C panic。
+        # 正确判据：v < 1000 视为"整度"，v >= 1000 视为"毫度"。
+        if [ "$v" -lt 1000 ]; then
+            v=$((v * 1000))
+        elif [ "$v" -gt 200000 ]; then
+            # >200°C 的读数一定是坏值（单位错 / 溢出），丢弃
+            continue
+        fi
         [ "$v" -gt "$best" ] && best=$v
     done
     TB=$best
@@ -452,15 +490,20 @@ WTOT_B=0; WSUM_B=0; WTOP_B=0; TSUM_B=0; TTOP_B=0
 WTOT_P=0; WSUM_P=0; WTOP_P=0
 _has_tis=0
 tis_scan(){    # $1=file  $2=threshold_freq  -> _t_sum _t_wsum _t_top (累计值)
-    local f j
-    _t_sum=0; _t_wsum=0; _t_top=0
-    while read -r f j rest; do
-        case "$f" in ''|*[!0-9]*) continue ;; esac
-        case "$j" in ''|*[!0-9]*) continue ;; esac
-        _t_sum=$(( _t_sum + j ))
-        _t_wsum=$(( _t_wsum + (f / 100) * j * 100 ))
-        [ "$f" -ge "$2" ] 2>/dev/null && _t_top=$(( _t_top + j ))
-    done < "$1"
+    # 【必须用 awk】time_in_state 是 16 档 × 几十万 tick，加权和 Σ(f×j) 量级
+    # ~5e12，而 /system/bin/sh (mksh) 是 32 位有符号：
+    #   直接累加 -> 溢出成负数（实测 wsum=-3.4e8，avg 算出 -59kHz）
+    #   先除后乘 -> 仍然溢出（(f/100)*j*100）
+    # awk 用 double，安全表示到 9e15。
+    _t_out=$(awk -v th="$2" '
+        $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ {
+            s += $2; w += $1 * $2
+            if ($1 >= th) t += $2
+        }
+        END { printf "%.0f %.0f %.0f\n", s, w, t }
+    ' "$1" 2>/dev/null)
+    set -- $_t_out
+    _t_sum=${1:-0}; _t_wsum=${2:-0}; _t_top=${3:-0}
 }
 # ---------------------------------------------------------------------
 # 撞顶率降级采样（无 time_in_state 时用）
@@ -485,7 +528,22 @@ read_power(){
     get "$BAT/voltage_now" 0; v=$_rv
     [ "$c" -lt 0 ] && c=$(( -c ))
     [ "$v" -le 0 ] 2>/dev/null && { POW=0; return; }
-    POW=$(( c / 1000 * (v / 1000) / 1000 ))
+    # 功耗计算。单位必须按实际节点判定，不能假设：
+    #   本机 current_now 单位是 mA（不是 Android 惯用的 µA）——实测满载 598、
+    #   静置 215；voltage_now 是 µV（3854000）。
+    #   若按 µA 算会小 1000 倍（598mA×3.8V 得 2mW 而不是 2272mW）。
+    # 判定法：电压 > 1e6 说明是 µV（手机电池 3-5V）；电流若 < 20000 说明是 mA。
+    POW=$(awk -v i="$c" -v u="$v" 'BEGIN {
+        if (i < 0) i = -i
+        # 电压：>1e6 当 µV，否则当 mV
+        vv = (u > 1000000) ? u / 1000 : u          # -> mV
+        # 电流：>20000 当 µA（20mA 以上），否则当 mA
+        ii = (i > 20000) ? i / 1000 : i            # -> mA（保留小数）
+        p = ii * vv / 1000                          # mA × mV / 1000 = mW
+        if (p < 0) p = -p
+        printf "%.0f", p
+    }' 2>/dev/null)
+    case "$POW" in ''|*[!0-9]*) POW=0 ;; esac
     if [ "$PWR_AVG" -eq 0 ] 2>/dev/null; then PWR_AVG=$POW
     else PWR_AVG=$(( (PWR_AVG * 7 + POW * 3) / 10 )); fi
 }
@@ -644,14 +702,20 @@ write_state(){
         echo "ts=$NOW"
         echo "tick=$TICK"
     } > "$STATE" 2>/dev/null
-    # 兼容镜像到 emulated 路径（失败不影响主链路）
-    cat "$STATE" > "$OBS/state" 2>/dev/null
+    # 兼容镜像到 emulated 路径。
+    # /storage/emulated 是 FUSE，I/O 卡住时同步写会阻塞整个控制循环
+    # （tick 停走 -> WebUI 判"服务未运行"）。改成降频 + 异步 + 防重入：
+    # 每 25 tick 才镜像一次，进程后台化，FUSE 真卡死时最多积 1 个。
+    if [ $((TICK % 25)) -eq 0 ] && [ ! -f "$D/.mirror.busy" ]; then
+        : > "$D/.mirror.busy" 2>/dev/null
+        { cat "$STATE" > "$OBS/state"; rm -f "$D/.mirror.busy"; } >/dev/null 2>&1 &
+    fi
 }
 cleanup(){
     [ "$RUN" = 0 ] && return
     RUN=0
     release_all
-    rm -f "$D/daemon.pid" "$D/touch.ts" "$D/.fg.busy"
+    rm -f "$D/daemon.pid" "$D/touch.ts" "$D/.fg.busy" "$D/.mirror.busy"
     log "退出 tick=$TICK，已归还"
     exit 0
 }
@@ -748,6 +812,7 @@ while [ "$RUN" = 1 ]; do
     QUIET=$((QUIET+1))
     # 被挪回冻结域就自己挪出来（开销：一次 read，无 fork）
     [ $((TICK % 10)) -eq 0 ] && self_thaw
+    SKIP_SERVO=0
 
     # ---------- L2 周期任务 ----------
     [ $((NOW - last_cfg)) -ge 5 ] && { load_cfg; last_cfg=$NOW; }
@@ -807,18 +872,29 @@ while [ "$RUN" = 1 ]; do
         PT=$_t_sum; PW=$_t_wsum; PN=$_t_top
         d=$(( PT - WTOT_B ))
         if [ "$d" -gt 0 ] 2>/dev/null; then
-            FAVG_B=$(( (PW - WSUM_B) / d ))
-            dt=$(( PN - WTOP_B ))
-            [ "$dt" -lt 0 ] && dt=0          # 口径切换保护
-            [ "$dt" -gt "$d" ] && dt=$d
-            SAT_B=$(( dt / d * 1000 + (dt % d) * 1000 / d ))
+            # Δ加权和可达 1e11，除法必须交给 awk：mksh 连 4.6e12/5.7e6
+            # 都会截断成 205（真值 815965），导致 FAVG_B 荒谬偏小。
+            _as=$(awk -v w1="$WSUM_B" -v w2="$PW" -v t1="$WTOP_B" -v t2="$PN" -v dd="$d" '
+                BEGIN {
+                    avg=(w2-w1)/dd; if(avg<0)avg=0
+                    sat=(t2-t1)*1000/dd
+                    if(sat<0)sat=0; if(sat>1000)sat=1000
+                    printf "%.0f %.0f\n", avg, sat
+                }')
+            set -- $_as
+            FAVG_B=${1:-0}; SAT_B=${2:-0}
         else
-            SAT_B=0; FAVG_B=$CAP_REF
+            # 本 tick 无 time_in_state 增量：不能拿 CAP_REF 当实测均频，
+            # 否则 need = CAP_REF×U/T —— 用自己设的上限当需求，正反馈自激
+            # （实测表现：cap 钉在某档不动，既不升也不降）。
+            SAT_B=0
+            [ "$FAVG_B" -le 0 ] && FAVG_B=$CAP_REF
+            SKIP_SERVO=1
         fi
         WTOT_B=$PT; WSUM_B=$PW; WTOP_B=$PN
     else
         poll_sat "$CAP_REF"; SAT_B=$_ps
-        FAVG_B=$CAP_REF
+        [ "$FAVG_B" -le 0 ] && FAVG_B=$CAP_REF
     fi
 
     # ---------- 4.2 需求密度前馈（绝对量，cap-invariant）----------
@@ -849,6 +925,9 @@ while [ "$RUN" = 1 ]; do
         NEED=$FLOOR_BIG
     fi
 
+    if [ "$SKIP_SERVO" = 1 ]; then
+        RAW=$CAP_B; BOOST=1000        # 无新采样 -> 维持现状，不做伺服
+    else
     # ---------- 4.3 撞顶率伺服 ----------
     BOOST=1000
     if [ "$SAT_B" -gt "$SAT_HI" ]; then
@@ -862,6 +941,7 @@ while [ "$RUN" = 1 ]; do
     # 必须禁用上行增益，否则 748<->1122 极限环振荡、永远落不下去
     if [ "$NEED" -le "$FLOOR_BIG" ]; then BOOST=1000; fi
     pct_mul "$NEED" "$BOOST"; RAW=$_pm
+    fi
 
     # ---------- 4.7 温度软增益 ----------
     if [ "$TB" -ge "$T_PANIC" ]; then
@@ -980,8 +1060,11 @@ while [ "$RUN" = 1 ]; do
         gets "$D/net.mode"; nm="$_rv"
         case "$nm" in wifi) BUD=$PWR_BUDGET_WIFI ;; *) BUD=$PWR_BUDGET_DATA ;; esac
         if [ "$PWR_AVG" -gt 0 ]; then
-            if [ "$PWR_AVG" -gt "$BUD" ] && [ "$TARGET" -lt 75 ]; then TARGET=$((TARGET+1))
-            elif [ "$PWR_AVG" -lt $((BUD - PWR_HYST)) ] && [ "$TARGET" -gt 35 ]; then TARGET=$((TARGET-1)); fi
+            if [ "$PWR_AVG" -gt "$BUD" ] && [ "$TARGET" -lt 75 ]; then
+                TARGET=$((TARGET+1)); TARGET_TUNED=1
+            elif [ "$PWR_AVG" -lt $((BUD - PWR_HYST)) ] && [ "$TARGET" -gt 35 ]; then
+                TARGET=$((TARGET-1)); TARGET_TUNED=1
+            fi
         fi
     fi
     [ $((NOW - last_learn)) -ge 3 ] && { learn_update; last_learn=$NOW; }

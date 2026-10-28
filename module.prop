@@ -1,6 +1,6 @@
 id=eta_sched
 name=8elite限频
-version=V1.4fix
-versionCode=141
+version=V1.4fix2
+versionCode=142
 author=罗霄山
-description=动态限频 V1.4fix：双判据容积伺服（需求密度前馈+撞顶率伺服）+整机功耗外环。修复守护进程被系统 cgroup 冻结导致 WebUI 误报"服务未运行"、watchdog 反复重启堆叠实例的严重 bug（启动即移出 app 冻结域 + pid+cmdline 单实例 + 看门狗识别冻结而非错杀）；按 probe 实测重写 cooling→频率真表（旧表为虚构）；WebUI 恢复 ksu.exec 字符串回调；修复 Android mksh 32 位算术溢出导致满载反而降频、撞顶率溢出、地板被击穿、幽灵触摸误判。空闲落 748M，重载直上 3.53G，充电自动放开，卸载零残留。
+description=动态限频 V1.4fix2：双判据容积伺服 + 整机功耗外环。修复：守护被 cgroup 冻结致 WebUI 报"服务未运行"、watchdog 错杀堆叠实例、map 表为虚构（已按 probe 实测重写）、mksh 32 位溢出（频率乘法/加权和/大数除法）、功耗单位误判致恒 0mW、功耗外环被 load_cfg 冲掉、state 镜像同步写 FUSE 阻塞、.fg.busy 残留致前台停摆、温度阈值与官方 trip point 冲突误 panic、幽灵触摸。实测静止 748.8M/51°C/730mW，满载 3072M/105°C/8.7W。
