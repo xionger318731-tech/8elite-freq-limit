@@ -137,9 +137,11 @@ target_load=50   # 目标占用基准，越低越激进
 
 ---
 
-## map 表（已实测校准）
+## map 表（自动生成）
 
-两张表都是在本机逐档写 `cur_state` 后读回 `scaling_max_freq` 得到的真值，不是推测：
+`config/map_big.conf` / `config/map_prime.conf` 是 **cooling `cur_state` → 真实 `scaling_max_freq`** 的映射表，决定模块能把每个簇压到多低。
+
+本机的两张表已按实测写入：
 
 ```
 大核  cooling_device0: state 0..15 → 3072000 ... 1152000, 960000, 748800, 556800, 384000
@@ -148,9 +150,28 @@ target_load=50   # 目标占用基准，越低越激进
 
 `state 0` 是**该 cooling 允许的最高档**，不是"不干预"。
 
-**换机型 / 换系统版本后必须重跑 `probe.sh`**：它会逐档写 `cur_state` 并打印真实频率，
-按输出替换两个 map 文件即可。`probe.sh` 同时检查 `time_in_state` 可用性
-（DCS 主数据源，缺失则降级为轮询 `scaling_cur_freq`）、功耗节点、温区、抢写进程。
+### 换机型 / 换系统版本：跑一次 probe.sh 即可
+
+```bash
+su -c 'sh /data/adb/eta_sched/probe.sh'
+```
+
+它会：
+
+1. 自动识别哪个 cooling_device 对应大核 / 超大核（用中档 state 试探，看哪个 policy 变了）
+2. 逐档写 `cur_state`，**等读回稳定**（连续 3 次相同才采纳，避免 cooling→cpufreq 联动滞后采错档）
+3. 生成并**自动写入**两张 map 文件（原文件自动备份为 `*.bak.<时间戳>`）
+4. 顺带检查：`time_in_state` 数据规模（提示是否会溢出）、功耗节点与单位（mA/µA）、温区与官方 trip point、抢写进程
+
+选项：
+
+| 参数 | 说明 |
+|---|---|
+| （无） | 生成报告 + 询问后写入 |
+| `--dry-run` | 只生成报告，不写文件（临时表留在 `/data/local/tmp/.probe_map_*.$$`） |
+| `--yes` / `-y` | 不询问，直接覆盖 |
+
+写完重启守护生效：`sh /data/adb/eta_sched/ctl.sh restart`
 
 ---
 

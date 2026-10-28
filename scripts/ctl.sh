@@ -1,6 +1,6 @@
 #!/system/bin/sh
 # ============================================================
-# 8elite限频 控制脚本 v1.4fix2
+# 8elite限频 控制脚本 v1.4fix3
 #   status  状态   start  启动   stop  停止
 #   mode    切换   release 归还  log   日志
 # ============================================================
@@ -53,7 +53,7 @@ _launch(){
 
 do_status(){
     echo "=============================================================="
-    echo "8elite限频 v1.4fix2"
+    echo "8elite限频 v1.4fix3"
     echo "=============================================================="
 
     local dp=""
@@ -229,7 +229,7 @@ case "$1" in
     release) do_release ;;
     log)     tail -n "${2:-20}" "$OBS/daemon.log" 2>/dev/null ;;
     *)
-        echo "8elite限频 v1.4fix2"
+        echo "8elite限频 v1.4fix3"
         echo ""
         echo "  status   查看状态"
         echo "  start    启动"

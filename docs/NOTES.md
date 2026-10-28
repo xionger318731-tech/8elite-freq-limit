@@ -515,9 +515,74 @@ Android 惯例 `current_now` 是 µA，本机实测是 **mA**：
 | 满载 cap | 748800 不升 | 3072000 |
 | temp | 误 panic | 105.3°C 正常 |
 
+
 ---
 
-## 十一、参考
+## 十一、probe.sh：从"手工抄表"改成"自动生成"
+
+### 为什么要改
+
+V1.4 之前 probe.sh 只打印表格，然后让用户手工把 32 行数字抄进两个 conf。
+实测这套流程出过两次问题：
+
+1. V1.3 的 map 表就是手工抄错的（把 state0 写成"不干预"，实际是最高档）
+2. V1.4 的 map 表干脆是**凭空编的**（声称 748800 不存在、超大核压不下去）
+
+只要还有"手工转录"这一步，就会继续错。改成自动生成 + 自动写入。
+
+### 归属判定：怎么知道哪个 cooling_device 管哪个簇
+
+不能按 `cooling_device0/1` 硬编码（不同机型编号不同）。做法：
+
+```
+1. 记下 baseline：policy0/scaling_max_freq 与 policy6/scaling_max_freq
+2. 把该 cooling 写到中档 state（max_state/2）
+3. 再读两个 policy：
+     只有 policy0 变了 -> 这个 cooling 管大核
+     只有 policy6 变了 -> 这个 cooling 管超大核
+     都没变 / 都变了 -> 跳过并报警
+4. state 归 0
+```
+
+### 采样时序竞态（必须处理）
+
+cooling→cpufreq 的联动**不是同步的**。实测：
+
+```
+echo 0 > cooling_device0/cur_state; sleep 0.15; cat scaling_max_freq
+  -> 3072000     (正确)
+echo 2 > cooling_device0/cur_state; sleep 0.15; cat scaling_max_freq
+  -> 3072000     (错误！还是上一档)
+echo 0 > ...; sleep 0.15; cat scaling_max_freq
+  -> 3532800     (错误！读到更高档)
+```
+
+第一版直接 `usleep 150000` 就采，生成的表里 `state0 = 3532800`、`state1 = 3321600`
+——**比冷却允许的最高值还高**，明显是采到了过渡态。
+
+修法 `set_state()`：写完 state 后轮询，**连续 3 次读到相同值**才采纳，最多等 3 秒。
+改完后生成结果与手工逐档实测**逐字节一致**。
+
+### 其它自动检查
+
+- `time_in_state` 的 Σticks / Σ(f×j) 规模，超过 2.1e9 时提示「必须用 awk」
+- 功耗节点单位判定：`current_now > 20000` 当 µA，否则当 mA；电压 `>1e6` 当 µV
+- 温区 trip point 与当前温度，用于校准 `T_SOFT/T_HARD/T_PANIC`
+- 抢写进程扫描
+
+### 用法
+
+```bash
+sh /data/adb/eta_sched/probe.sh             # 报告 + 询问后写入
+sh /data/adb/eta_sched/probe.sh --dry-run   # 只看不写
+sh /data/adb/eta_sched/probe.sh --yes       # 不问直接写
+```
+
+写入前自动备份 `*.bak.<时间戳>`，写完提示 `ctl.sh restart`。
+
+---
+
+## 十二、参考
 
 - Qualcomm `msm_performance` / `cooling_device` 内核接口
 - Android `time_in_state` 语义

@@ -1,6 +1,6 @@
 id=eta_sched
 name=8elite限频
-version=V1.4fix2
-versionCode=142
+version=V1.4fix3
+versionCode=143
 author=罗霄山
-description=动态限频 V1.4fix2：双判据容积伺服 + 整机功耗外环。修复：守护被 cgroup 冻结致 WebUI 报"服务未运行"、watchdog 错杀堆叠实例、map 表为虚构（已按 probe 实测重写）、mksh 32 位溢出（频率乘法/加权和/大数除法）、功耗单位误判致恒 0mW、功耗外环被 load_cfg 冲掉、state 镜像同步写 FUSE 阻塞、.fg.busy 残留致前台停摆、温度阈值与官方 trip point 冲突误 panic、幽灵触摸。实测静止 748.8M/51°C/730mW，满载 3072M/105°C/8.7W。
+description=动态限频 V1.4fix3：probe.sh 改为自动识别 cooling 归属并生成/写入 map 表（含读回稳定等待，避免采样竞态）。继承 V1.4fix2 全部修复：cgroup 冻结、mksh 32 位溢出、功耗单位、外环被冲、FUSE 阻塞、温度阈值等。实测静止 748.8M/51°C/730mW，满载 3072M/105°C/8.7W。
