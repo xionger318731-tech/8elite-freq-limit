@@ -19,4 +19,6 @@ chmod 755 "$DATA"/*.sh 2>/dev/null
 
 [ -f "$BASE/config.conf" ] || printf 'mode=auto\nenabled=1\nstyle=eco\n' > "$BASE/config.conf"
 
+# 脱离 app 冻结域后再拉起（开机时通常已在根 cgroup，作为兜底）
+echo $$ > /sys/fs/cgroup/cgroup.procs 2>/dev/null
 sh "$DATA/ctl.sh" start 2>/dev/null

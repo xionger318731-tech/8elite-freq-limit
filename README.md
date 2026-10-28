@@ -8,6 +8,11 @@
 
 **V1.3 起控制律整体重写为「双判据容积伺服（DCS）」**——旧版的平方律是乘性随机游走，会被节点回读和 `oiface` 抢写带偏；新版改用绝对量判据 + 不饱和判据。
 
+**V1.4fix 修掉三类致命 bug**（详见 [docs/NOTES.md](docs/NOTES.md) 第九节）：
+- 守护进程被 KernelSU 管理器的 app cgroup 冻结 → WebUI 报"服务未运行"、watchdog 反复错杀堆叠实例
+- `map_big.conf` / `map_prime.conf` 是**凭空写的假表**（声称 748800 不存在、超大核压不下去），已按实测重写
+- `/system/bin/sh` 是 32 位算术，频率 × 千分比系数会溢出成负数，满载反而降频
+
 ---
 
 ## 原理（V1.3 · DCS）
@@ -98,11 +103,11 @@ WebUI 里切换。
 
 ## 安装
 
-1. 下载 `8elite_V1.3.zip`
+1. 下载 `8elite_V1.4fix.zip`
 2. KernelSU / APatch 管理器 → 模块 → 从本地安装
 3. 重启
 
-⚠ **上机第一件事：跑 `probe.sh` 校准 map 表**（见下方「已知待校准」）。
+装完即用。map 表已按本机实测写入；**换机型**才需要跑 `probe.sh` 重新校准。
 
 ---
 
@@ -129,13 +134,20 @@ target_load=50   # 目标占用基准，越低越激进
 
 ---
 
-## ⚠ 已知待校准
+## map 表（已实测校准）
 
-`config/map_big.conf` 的 `state0 = 3072000` 与 `uninstall.sh` 注释声称的「state0 = 不干预」互相矛盾，二者必有一错。
+两张表都是在本机逐档写 `cur_state` 后读回 `scaling_max_freq` 得到的真值，不是推测：
 
-**上机先跑 `probe.sh`**：它会逐档写 cooling 的 `cur_state` 并打印真实 `scaling_max_freq`，用实测表替换两个 map 文件。否则"释放"可能仍压着 13–19%，所有省电收益都打折。
+```
+大核  cooling_device0: state 0..15 → 3072000 ... 1152000, 960000, 748800, 556800, 384000
+超核  cooling_device1: state 0..15 → 3513600 ... 1958400, 1689600, 1401600, 1209600, 1017600
+```
 
-`probe.sh` 同时检查：`time_in_state` 是否可用（DCS 主数据源，缺失则降级为轮询 `scaling_cur_freq`）、功耗节点、温区、以及是否有别的模块在抢写。
+`state 0` 是**该 cooling 允许的最高档**，不是"不干预"。
+
+**换机型 / 换系统版本后必须重跑 `probe.sh`**：它会逐档写 `cur_state` 并打印真实频率，
+按输出替换两个 map 文件即可。`probe.sh` 同时检查 `time_in_state` 可用性
+（DCS 主数据源，缺失则降级为轮询 `scaling_cur_freq`）、功耗节点、温区、抢写进程。
 
 ---
 

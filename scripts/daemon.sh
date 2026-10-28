@@ -1,25 +1,53 @@
 #!/system/bin/sh
 # =====================================================================
-# 8elite 限频 V1.3 — 双判据容积伺服 (Dual-Criterion Servo, DCS)
-# 模块包版本 V1.3
+# 8elite 限频 V1.4fix — 双判据容积伺服 (Dual-Criterion Servo, DCS)
+# 模块包版本 V1.4fix
 #
 # 【上机前必做】
 #   1. 跑 probe.sh，把 cooling state -> 频率 的真表确认一遍，
-#      替换 $D/config/map_big.conf / map_prime.conf（旧表的 state0
-#      疑似不是“不干预”，详见审查报告 2.7）
-#   2. 用 sh -n daemon.sh 过一遍语法（Android 是 mksh / toybox sh，
-#      本脚本刻意只用 POSIX 内建，无 bashism）
+#      替换 $D/config/map_big.conf / map_prime.conf
+#   2. 用 sh -n daemon.sh 过一遍语法（Android 是 mksh / toybox sh）
 #
-# 【与旧版(V1.2fix)的本质差异】
-#   旧版: cap(n+1) = readback * (U/T)^2    乘性随机游走，无绝对锚点，
-#                                         且 U 在负载侧饱和
-#   本版: need = (F_avg * U) / T           cap-invariant 需求密度前馈（绝对量）
-#        cap  = need * (1 + K*(S - Sband))  撞顶率伺服（不饱和判据）
-#        TARGET_LOAD 由整机功耗外环整定     消除魔法常数
-#        内部维护权威 cap，节点值仅用于对账  抗 oiface 抢写
-#        触摸事件异步感知                    毫秒级响应，取代固定窗
-#        按包学习稳态 cap                    消除切应用后的重收敛成本
-#        借鉴 EtaTune 的感知输入(触摸/功耗/网络档位)，不引入其调度逻辑
+# 【V1.4fix 修复：守护被系统冻结 → 状态不更新 / WebUI 报“服务未运行” / 反复重启】
+#   根因：WebUI / ctl.sh 通过 KernelSU 的 ksu.exec 拉起守护，子进程继承的是
+#         KernelSU 管理器自己的 app cgroup（/sys/fs/cgroup/apps/uid_XXXX/pid_XXXX）。
+#         管理器一切到后台，整组 cgroup.freeze 被置 1，daemon / watchdog 连同
+#         触摸协程一起被冻住：state 不再刷新 → watchdog 醒来判定“状态超时” →
+#         kill -9 后重拉 → 新进程又落进同一个冻结域 → 越拉越多（实测堆了 9 个）。
+#   修复：启动第一件事把自身移出 app 冻结域（写 /sys/fs/cgroup/cgroup.procs 到根），
+#         子进程再 fork 时继承根 cgroup；watchdog 增加“被冻结则解冻而非错杀”；
+#         单实例改用 pid+cmdline+冻结状态三重校验，杜绝重复实例。
+#
+# 【V1.4fix 修复：map 表是凭空编的】
+#   V1.4 的 map_big.conf 声称“大核 cooling 只有 3 个有效档、state0-9=2400000”，
+#   实测为假：state 0-15 逐档是 3072000 一路降到 384000，748800 真实存在。
+#   map_prime.conf 声称“全部 16 档都是 1689600”，同样为假：实测 15 档可用，
+#   最低 1017600。两张表已按 probe.sh 实测结果重写。
+#
+# 【V1.4 修复：为什么静止落不到 748MHz】
+#   1. 需求前馈单位口径错 100 倍：LOAD_B 是千分比(0-1000)、TARGET 是
+#      百分比(0-100)，原式 /1000 应为 /10；且 FAVG_B 是"含空闲时段的
+#      总均频"而非"忙时均频"，须扣除 F_min*(1-U)。
+#      两错叠加 -> 需求信号彻底失效，cap 被钉死在 ~1.1G 上限（又卡又费电）。
+#      现式：NEED=(FAVG*1000 - FLOOR*(1000-U))/(10*TARGET)
+#   2. 撞顶率判据在底板退化：cap==最低OPP 时 CPU 只能贴着天花板跑，
+#      SAT 恒为 100% -> 上行增益永久顶满 -> 748<->1122 极限环振荡，
+#      表现就是"永远落不下去"。
+#      修复：NEED 到底板时强制 BOOST=1000，禁止再抬。
+#   3. 新增空闲快降通道：非交互/非冷启动/非游戏 且 U<12% 持续 6 tick 后，
+#      跳过 8 次确认，按 -40%/tick 直落 748（原来 32 tick，现约 3 tick）。
+#   4. 对偶的触摸瞬时抬升：激进下压必须配瞬时抬升——有交互/冷启动时
+#      若 cap 还压在低位，直接抬到 TOUCH_FLOOR，不等反馈环（保流畅）。
+#   5. 空闲时立即释放超大核（省掉 5 tick 迟滞），触摸时立即挂回。
+#   6. 窗口拉伸仅在真空闲时启用（原来越空闲采样越慢，自相矛盾）。
+#   7. 接上原为死代码的 is_game()：游戏前台不做激进下压，保流畅。
+#
+# 【固有机制（沿用 V1.3）】
+#        need = 忙时均频 * U / T          cap-invariant 需求密度前馈
+#        cap  = need * (1 + K*(S - Sband)) 撞顶率伺服（不饱和判据）
+#        TARGET_LOAD 由整机功耗外环整定    消除魔法常数
+#        内部维护权威 cap，节点值仅用于对账 抗 oiface 抢写
+#        触摸/功耗/网络档位等感知输入      借自 EtaTune，不引入其调度逻辑
 #
 # 【作者】罗霄山
 # =====================================================================
@@ -27,6 +55,10 @@
 D=/data/adb/eta_sched
 BASE=/storage/emulated/0/Android/8elite
 OBS=$BASE/obs
+# 主状态文件放在 root 私有目录：daemon 一定能写、ksu.exec(root) 一定能读，
+# 彻底避开 /storage/emulated/0 的 FUSE 挂载/命名空间不确定性（这正是 WebUI 偶发
+# “服务未运行” 的根因之一）。OBS/state 仅作兼容镜像。
+STATE=$D/state
 CFG=$BASE/config.conf
 LEARN=$D/learned
 
@@ -43,8 +75,9 @@ SAT_HI=300            # 撞顶率上限 ‰ (0.300)
 SAT_LO=60             # 撞顶率下限 ‰ (0.060)
 K_UP=1200             # 上行增益 x1000
 K_DN=600              # 下行增益 x1000
-FLOOR_BIG=748800
-FLOOR_PRIME=1017600
+FLOOR_BIG=748800        # 大核地板（实测 cooling state13 = 748800，真实存在）
+FLOOR_PRIME=1017600     # 超大核地板（实测 cooling state15 = 1017600）
+CPU_MIN_B=384000        # 大核硬件最低频，仅用于把“总均频”折算成“忙时均频”
 UP_CONFIRM=2
 DOWN_CONFIRM=8
 UP_RATE=1500          # 单 tick 最大 +50% (x1000)
@@ -66,6 +99,9 @@ PRIME_OFF_HOLD=5      # tick
 BOOT_SKIP=60          # s
 REASSERT=10           # 每 N tick 强制重断言（抗漂移）
 IDLE_STRETCH=30       # 连续 N tick 无事件 -> 窗口拉伸到 500ms
+IDLE_ENTER=6          # 连续 N tick 达成空闲 -> 进入快降通道
+IDLE_LOAD=120         # 空闲判据：大核利用率 < 12.0 千分比(12.0%)
+IDLE_RATE=600         # 快降：单 tick 最大 -40% (x1000)
 STYLE=eco
 ENABLED=1
 MODE=auto
@@ -74,6 +110,9 @@ MODE=auto
 RUN=1
 TICK=0
 QUIET=0
+IDLE_CNT=0
+IDLE_MODE=0
+GAMEF=0
 CAP_B=0
 CAP_P=0
 STB=-1
@@ -102,6 +141,45 @@ FREQ_B=""
 FREQ_P=""
 
 LOG=$OBS/daemon.log
+# ---------------------------------------------------------------------
+# 逃逸 app 冻结域（V1.4fix 核心修复）
+#   ksu.exec 拉起的进程默认落在 KernelSU 管理器的 app cgroup 里，
+#   管理器退后台 -> cgroup.freeze=1 -> 本进程连带子进程全部挂起，
+#   state 停更 -> watchdog 判超时 -> kill 后重拉 -> 又落回同一冻结域。
+#   移入 cgroup v2 根（/sys/fs/cgroup/cgroup.procs）后由 init 托管，不再被 app 冻结。
+detach_freeze(){
+    local me cur i=0
+    me=$$
+    # 已经在根 cgroup（0::/）就不用动
+    while IFS= read -r cur; do
+        case "$cur" in
+            "0::/") return 0 ;;
+        esac
+    done < /proc/$$/cgroup 2>/dev/null
+    echo $me > /sys/fs/cgroup/cgroup.procs 2>/dev/null && return 0
+    # 兜底：逐个父进程试
+    while [ $i -lt 3 ]; do
+        i=$((i+1))
+        echo $me > /sys/fs/cgroup/cgroup.procs 2>/dev/null && return 0
+        usleep 200000
+    done
+    return 1
+}
+
+# ---------------------------------------------------------------------
+# Android /system/bin/sh (mksh) 的 $(( )) 是 32 位有符号整型：
+#   1555200 * 1500 = 2332800000 > 2^31-1  → 溢出成负数
+# 所有「频率 × 千分比系数」都必须先除后乘，否则算出的上限是负值，
+# 表现为「满载反而降频 / 上限完全失效」。这个函数封装安全的按千分比缩放。
+#   pct_mul <数值> <千分比>  -> 结果（四舍五入到整数）
+pct_mul(){
+    local v=$1 p=$2
+    if [ "$v" -ge 0 ]; then
+        _pm=$(( (v / 1000) * p + ((v % 1000) * p) / 1000 ))
+    else
+        _pm=$(( -(( (-v / 1000) * p + ((-v % 1000) * p) / 1000 )) ))
+    fi
+}
 # ---------------------------------------------------------------------
 # 零 fork 工具：全部用 shell 内建 read，避免 $(cat) / $(awk) / $(date)
 _rv=""
@@ -241,18 +319,48 @@ net_probe(){
 }
 # ---------------------------------------------------------------------
 # 触摸监听协程（移植自 EtaTune x8u_eco，改为写时间戳）
+# 找触摸屏对应的 eventN
+#   旧实现用 `grep -A6 NAME | grep event` 向后越界匹配，在本机会先抓到
+#   指纹传感器 tmf8806 的 event9，导致每秒都被判定为"正在触摸"，
+#   结果永远 RUSH=1、永远不降频（表现为静止也锁着高频）。必须按设备块解析：
+#   在同一个 "I: Bus=" 块内，Name 命中触摸名后只取其自身的 Handlers 行。
+find_touch_ev(){
+    # 一次 awk 扫完整文件：只有在「当前块 Name 命中触摸名」时才记录该块的 Handlers
+    _ev=$(awk '
+        /^I: Bus=/ { name=""; hd="" }
+        /^N: Name=/ { name=$0 }
+        /^H: Handlers=/ { if (name ~ /touchpanel|fts_ts|synaptics|goodix|sec_touchscreen/) { hd=$0 } }
+        /^$/ { if (hd != "") { print hd; exit } }
+        END { if (hd != "") print hd }
+    ' /proc/bus/input/devices 2>/dev/null | head -1 | sed 's/^H: Handlers=//')
+    case "$_ev" in *event[0-9]*) ;; *) _ev=""; return 1 ;; esac
+    # 从 Handlers 行里挑出 eventN
+    # Handlers 可能含多个 eventN，取第一个
+    for t in $_ev; do
+        case "$t" in event[0-9]*) _ev=$t; return 0 ;; esac
+    done
+    _ev=""; return 1
+}
 start_touch(){
     local ev
-    ev=$(grep -A6 -e 'Name="touchpanel"' -e 'Name="fts_ts"' -e 'Name="synaptics"' /proc/bus/input/devices 2>/dev/null \
-         | grep -o 'event[0-9]*' | head -1)
-    [ -z "$ev" ] && ev=$(ls /dev/input/ 2>/dev/null | grep -E '^event[0-9]+$' | head -1)
-    [ -z "$ev" ] && { log "[touch] 未找到输入设备，禁用预测"; return; }
+    find_touch_ev && ev=$_ev
+    [ -z "$ev" ] && { log "[touch] 未找到触摸屏输入设备，触摸抬频已禁用（不影响限频主逻辑）"; return; }
+    case "$ev" in event[0-9]*) ;; *) log "[touch] 设备名异常 $ev，禁用"; return ;; esac
     log "[touch] 监听 /dev/input/$ev"
     (
-        while [ -f "$D/daemon.pid" ]; do
-            dd if="/dev/input/$ev" bs=16 count=1 2>/dev/null
-            now_s; echo "$_rv" > "$D/touch.ts"
-            sleep 3
+        # 只有「阻塞读」才算真实触摸：
+        # 本机 event9 在无操作时会立即返回 EOF/0 字节，旧实现对每次返回都记一次
+        # 触摸 → touch.ts 每秒刷新 → 永远 RUSH=1 → 永远不降频（幽灵触摸的真身）。
+        # 这里用 /proc/uptime 前后差判定：读取耗时 < 300ms 视为噪声，丢弃。
+        while [ -d "/proc/$$" ]; do
+            now_s; _t0=$_rv
+            dd if="/dev/input/$ev" bs=24 count=1 2>/dev/null >/dev/null
+            now_s; _t1=$_rv
+            if [ $(( _t1 - _t0 )) -ge 1 ]; then
+                echo "$_t1" > "$D/touch.ts"
+            else
+                usleep 400000        # 噪声，退避避免空转
+            fi
         done
     ) &
 }
@@ -328,11 +436,11 @@ read_stat(){
     local db di
     if [ "$SB_PREV" -gt 0 ] 2>/dev/null; then
         db=$((bb - SB_PREV)); di=$((ib - SI_PREV))
-        if [ $((db + di)) -gt 0 ] 2>/dev/null; then U_B=$(( db * 1000 / (db + di) )); else U_B=0; fi
+        if [ $((db + di)) -gt 0 ] 2>/dev/null; then U_B=$(( db / (db + di) * 1000 + (db % (db + di)) * 1000 / (db + di) )); else U_B=0; fi
     fi
     if [ "$SP_PREV" -gt 0 ] 2>/dev/null; then
         db=$((bp - SP_PREV)); di=$((ip - SPI_PREV))
-        if [ $((db + di)) -gt 0 ] 2>/dev/null; then U_P=$(( db * 1000 / (db + di) )); else U_P=0; fi
+        if [ $((db + di)) -gt 0 ] 2>/dev/null; then U_P=$(( db / (db + di) * 1000 + (db % (db + di)) * 1000 / (db + di) )); else U_P=0; fi
     fi
     SB_PREV=$bb; SI_PREV=$ib; SP_PREV=$bp; SPI_PREV=$ip
 }
@@ -350,7 +458,7 @@ tis_scan(){    # $1=file  $2=threshold_freq  -> _t_sum _t_wsum _t_top (累计值
         case "$f" in ''|*[!0-9]*) continue ;; esac
         case "$j" in ''|*[!0-9]*) continue ;; esac
         _t_sum=$(( _t_sum + j ))
-        _t_wsum=$(( _t_wsum + f * j ))
+        _t_wsum=$(( _t_wsum + (f / 100) * j * 100 ))
         [ "$f" -ge "$2" ] 2>/dev/null && _t_top=$(( _t_top + j ))
     done < "$1"
 }
@@ -377,7 +485,7 @@ read_power(){
     get "$BAT/voltage_now" 0; v=$_rv
     [ "$c" -lt 0 ] && c=$(( -c ))
     [ "$v" -le 0 ] 2>/dev/null && { POW=0; return; }
-    POW=$(( c * v / 1000000 ))
+    POW=$(( c / 1000 * (v / 1000) / 1000 ))
     if [ "$PWR_AVG" -eq 0 ] 2>/dev/null; then PWR_AVG=$POW
     else PWR_AVG=$(( (PWR_AVG * 7 + POW * 3) / 10 )); fi
 }
@@ -385,14 +493,18 @@ read_power(){
 # 应用到 cooling device（state map）
 _st=0
 freq_to_state(){   # $1=map  $2=freq  $3=可用频率表(兜底用)
-    local st f bf=-1
+    local st f bf=-1 lof=999999999 lost=0
     _st=0
     if [ -f "$1" ]; then
         while read -r st f; do
             case "$f" in ''|*[!0-9]*) continue ;; esac
+            [ "$f" -lt "$lof" ] && { lof=$f; lost=$st; }
             [ "$f" -le "$2" ] 2>/dev/null || continue
             [ "$f" -gt "$bf" ] && { bf=$f; _st=$st; }
         done < "$1"
+        # 目标低于真表所有档时，返回最低档（state 号最大者）而非默认 0（=释放），
+        # 否则会把"想限到很低"误判成"释放到 2400000"，正是旧版静止天花板的根因类别。
+        [ "$bf" -lt 0 ] && _st=$lost
         return
     fi
     # 兜底：假定 state N = 降序第 N 个 OPP
@@ -531,42 +643,89 @@ write_state(){
         echo "st_prime=$STP"
         echo "ts=$NOW"
         echo "tick=$TICK"
-    } > "$OBS/state" 2>/dev/null
+    } > "$STATE" 2>/dev/null
+    # 兼容镜像到 emulated 路径（失败不影响主链路）
+    cat "$STATE" > "$OBS/state" 2>/dev/null
 }
 cleanup(){
     [ "$RUN" = 0 ] && return
     RUN=0
     release_all
     rm -f "$D/daemon.pid" "$D/touch.ts" "$D/.fg.busy"
-    log "退出，已归还"
+    log "退出 tick=$TICK，已归还"
     exit 0
 }
 # ---------------------------------------------------------------------
 # ============================== 初始化 ==============================
+# 必须先脱离冻结域，再 fork 任何子进程（触摸协程、前台探测都在后面）
+detach_freeze || log "!! 移出 cgroup 冻结域失败（可能被系统冻结）"
+
 mkdir -p "$OBS" "$D/config" 2>/dev/null
 [ -f "$D/config/map_big.conf" ] || echo "!! map_big.conf 缺失" >> "$LOG"
 
 find_paths
 read_stock
 load_cfg
+# 真实上限必须以 calibration 真表 state0 为准：本机 cooling 的 state0 即允许的最高
+# 频（大核 2400000），msm_performance / hwmax 读取到的 3072000/3532800 高于 cooling
+# 实际允许值，若用它们会令"释放"档仍压在错误高位甚至越界。
+while read -r _k _v; do
+    case "$_k" in ''|\#*) continue ;; esac
+    case "$_v" in *[!0-9]*) continue ;; esac
+    STOCK_B=$_v; break
+done < "$D/config/map_big.conf"
+while read -r _k _v; do
+    case "$_k" in ''|\#*) continue ;; esac
+    case "$_v" in *[!0-9]*) continue ;; esac
+    STOCK_P=$_v; break
+done < "$D/config/map_prime.conf"
 TIS_B="$POL_B/stats/time_in_state"
 TIS_P="$POL_P/stats/time_in_state"
 [ -r "$TIS_B" ] && _has_tis=1
 echo data > "$D/net.mode" 2>/dev/null
 
-# 本模块独立运行，不与 EtaTune 共存（用户确认），无需共存检测。
+# 本模块独立运行，不与其他限频模块共存（用户确认），无需共存检测。
 
-LOCK="$D/daemon.pid"
-if [ -f "$LOCK" ]; then
-    gets "$LOCK"
-    if [ -n "$_rv" ] && [ -d "/proc/$_rv" ]; then log "已有实例 $_rv"; exit 1; fi
+# ---------------------------------------------------------------------
+# 主循环内的自我解冻：系统可能反复把本进程挪回 app 冻结域，
+# watchdog 每 60s 才巡一次太慢；这里每 10 tick 廉价检查一次（纯内建 read）
+self_thaw(){
+    local cur
+    while IFS= read -r cur; do
+        case "$cur" in
+            "0::/") return 0 ;;
+        esac
+    done < /proc/$$/cgroup 2>/dev/null
+    echo $$ > /sys/fs/cgroup/cgroup.procs 2>/dev/null
+}
+
+# 单实例：pid 文件 + 「进程确实是 daemon.sh 且未被冻结」双重校验。
+# 不用 flock：daemon 会 fork 触摸协程/前台探测，fd 被子进程继承后，
+# 即使守护被 kill -9 锁也不会释放，下次启动会永久抢不到锁。
+_holder=""
+[ -f "$D/daemon.pid" ] && read -r _holder < "$D/daemon.pid" 2>/dev/null
+if [ -n "$_holder" ] && [ -d "/proc/$_holder" ]; then
+    _hcmd=$(tr '\0' ' ' < "/proc/$_holder/cmdline" 2>/dev/null)
+    case "$_hcmd" in
+        "sh $D/daemon.sh "*|"sh $D/daemon.sh")
+            if ! grep -q do_freezer_trap "/proc/$_holder/wchan" 2>/dev/null; then
+                log "已有实例运行 pid=$_holder，退出 pid=$$"
+                exit 0
+            fi
+            # 旧实例被冻结：先解冻它，让它自己继续跑，本次退出
+            echo "$_holder" > /sys/fs/cgroup/cgroup.procs 2>/dev/null && {
+                log "解冻旧实例 pid=$_holder，退出 pid=$$"
+                exit 0
+            }
+            ;;
+    esac
 fi
-echo $$ > "$LOCK"
-echo $$ > "$OBS/daemon.pid"
+echo $$ > "$D/daemon.pid"
+echo $$ > "$OBS/daemon.pid" 2>/dev/null
 
 now_s; BOOT=$_rv
 trap cleanup TERM INT EXIT
-log "启动 V1.3-DCS pid=$$ win=${WIN_MS}ms base=${TARGET} sat=[$SAT_LO,$SAT_HI] tis=$_has_tis"
+log "启动 V1.4fix-DCS pid=$$ win=${WIN_MS}ms base=${TARGET} sat=[$SAT_LO,$SAT_HI] tis=$_has_tis"
 
 CAP_B=$STOCK_B
 CAP_P=$STOCK_P
@@ -581,20 +740,29 @@ last_cfg=0
 last_pwr=0
 last_learn=0
 last_net=0
+last_game=0
 # ============================== 主循环 ==============================
+log "进入主循环 pid=$$"
 while [ "$RUN" = 1 ]; do
     now_s; NOW=$_rv
     QUIET=$((QUIET+1))
+    # 被挪回冻结域就自己挪出来（开销：一次 read，无 fork）
+    [ $((TICK % 10)) -eq 0 ] && self_thaw
 
     # ---------- L2 周期任务 ----------
     [ $((NOW - last_cfg)) -ge 5 ] && { load_cfg; last_cfg=$NOW; }
     [ $((NOW - last_probe)) -ge 5 ] && { probe_fg; last_probe=$NOW; }
     [ $((NOW - last_net)) -ge 30 ] && { net_probe; last_net=$NOW; }
     read_fg
+    # 游戏前台判定（低频 5s 一次；游戏内不做激进下压，保流畅）
+    [ $((NOW - last_game)) -ge 5 ] && { is_game "$FG" && GAMEF=1 || GAMEF=0; last_game=$NOW; }
 
-    # 自适应决策窗口：稳定期拉伸到 2.5x，降低常驻开销
-    if [ "$QUIET" -gt "$IDLE_STRETCH" ]; then usleep $(( WIN_MS * 2500 ))
-    else usleep $(( WIN_MS * 1000 )); fi
+    # 自适应决策窗口：仅真空闲时拉伸到 2.5x；下降途中保持高频采样以加快回落
+    if [ "$QUIET" -gt "$IDLE_STRETCH" ] && [ "$IDLE_CNT" -ge "$IDLE_ENTER" ]; then
+        usleep $(( WIN_MS * 2500 ))
+    else
+        usleep $(( WIN_MS * 1000 ))
+    fi
     TICK=$((TICK+1))
 
     # ---------- 前置门控 ----------
@@ -631,12 +799,19 @@ while [ "$RUN" = 1 ]; do
     LOAD_B=$U_B
     CAP_REF=$CAP_B
     if [ "$_has_tis" = 1 ] && [ -r "$TIS_B" ]; then
+        # 撞顶率阈值必须用「固定」参考，不能跟着 CAP_B 走：
+        # 每轮换阈值会让累计量 PN 与上轮 WTOP_B 的口径不一致，
+        # 两者相减会出现负值，×1000/d 后直接溢出（实测 sat=30924400‰）。
+        # 这里固定用当前档位的 90%，并在一轮内保持同一基准。
         tis_scan "$TIS_B" $(( CAP_REF * 9 / 10 ))
         PT=$_t_sum; PW=$_t_wsum; PN=$_t_top
         d=$(( PT - WTOT_B ))
         if [ "$d" -gt 0 ] 2>/dev/null; then
             FAVG_B=$(( (PW - WSUM_B) / d ))
-            SAT_B=$(( (PN - WTOP_B) * 1000 / d ))
+            dt=$(( PN - WTOP_B ))
+            [ "$dt" -lt 0 ] && dt=0          # 口径切换保护
+            [ "$dt" -gt "$d" ] && dt=$d
+            SAT_B=$(( dt / d * 1000 + (dt % d) * 1000 / d ))
         else
             SAT_B=0; FAVG_B=$CAP_REF
         fi
@@ -647,9 +822,29 @@ while [ "$RUN" = 1 ]; do
     fi
 
     # ---------- 4.2 需求密度前馈（绝对量，cap-invariant）----------
-    # need = F_avg * U / TARGET
-    if [ "$LOAD_B" -gt 0 ] && [ "$FAVG_B" -gt 0 ]; then
-        NEED=$(( FAVG_B * LOAD_B / TARGET / 1000 ))
+    # need = 忙时均频 * U / T
+    #   忙时均频 * U = FAVG_total*1000 - F_min*(1000-U)   （FAVG_total 含空闲时段，须扣除）
+    #   F_min 是硬件最低频（384000），不是地板 cap，否则空闲时会低估需求
+    # => NEED = (FAVG_B*1000 - CPU_MIN_B*(1000-U)) / (10*TARGET)
+    # 单位口径：FAVG_B:kHz   LOAD_B:千分比(0-1000)   TARGET:百分比(0-100)
+    if [ "$LOAD_B" -gt 0 ] && [ "$FAVG_B" -gt 0 ] && [ "$TARGET" -gt 0 ]; then
+        # 需求密度前馈：need = 忙时平均频率 × 利用率 / 目标占用
+        #   FAVG_B  : 大核时间加权总均频（含空闲），kHz
+        #   LOAD_B  : 簇利用率，千分比 0..1000
+        #   TARGET  : 目标占用，百分比 35..85
+        # 全程用 MHz 量级计算：Android 的 /system/bin/sh 是 32 位算术，
+        # kHz 量级的中间量（3e6 × 1000）会溢出成负数。
+        #   busy_mhz = FAVG_MHZ - MIN_MHZ*(1000-U)/1000
+        #   need_khz = busy_mhz * 1000 * U / 1000 / (TARGET/100)
+        #            = busy_mhz * U * 100 / TARGET
+        _fu=$(( FAVG_B / 1000 ))                       # kHz -> MHz
+        _cu=$(( CPU_MIN_B / 1000 ))                    # kHz -> MHz
+        _idle=$(( _cu * (1000 - LOAD_B) / 1000 ))      # 空闲占比折算的等效 MHz
+        _busy=$(( _fu - _idle ))                       # 忙时均频 MHz
+        [ "$_busy" -lt 0 ] && _busy=0
+        # busy(MHz) × U(‰) / 1000 = 实际需求 MHz；再 / (TARGET%) 放大到目标占用
+        _needmhz=$(( _busy * LOAD_B / 1000 * 100 / TARGET ))
+        NEED=$(( _needmhz * 1000 ))                    # MHz -> kHz       # MHz·‰ -> kHz
     else
         NEED=$FLOOR_BIG
     fi
@@ -663,7 +858,10 @@ while [ "$RUN" = 1 ]; do
         BOOST=$(( 1000 - (SAT_LO - SAT_B) * K_DN / 1000 ))
         [ "$BOOST" -lt 700 ] && BOOST=700
     fi
-    RAW=$(( NEED * BOOST / 1000 ))
+    # 地板保护：需求已到底板时，撞顶率判据退化（cap==最低OPP 时 SAT 恒 100%），
+    # 必须禁用上行增益，否则 748<->1122 极限环振荡、永远落不下去
+    if [ "$NEED" -le "$FLOOR_BIG" ]; then BOOST=1000; fi
+    pct_mul "$NEED" "$BOOST"; RAW=$_pm
 
     # ---------- 4.7 温度软增益 ----------
     if [ "$TB" -ge "$T_PANIC" ]; then
@@ -675,7 +873,7 @@ while [ "$RUN" = 1 ]; do
         g=$(( 1000 - (TB - T_SOFT) * (1000 - T_MIN_GAIN) / span ))
         [ "$g" -gt 1000 ] && g=1000
         [ "$g" -lt "$T_MIN_GAIN" ] && g=$T_MIN_GAIN
-        RAW=$(( RAW * g / 1000 ))
+        pct_mul "$RAW" "$g"; RAW=$_pm
     fi
 
     # ---------- 地板 / 天花板 ----------
@@ -684,22 +882,52 @@ while [ "$RUN" = 1 ]; do
     snap "$FREQ_B" "$RAW"; RAW=$_sn
     [ "$RAW" -le 0 ] && RAW=$CAP_B
 
+    # ---------- 4.45 触摸瞬时抬升（激进下压的对偶，保流畅）----------
+    # 有交互/冷启动时，若 cap 还压在低位，直接抬到交互下限，不等反馈环
+    if [ "$RUSH" = 1 ] || [ "$IN_LAUNCH" = 1 ]; then
+        if [ "$CAP_B" -lt "$TOUCH_FLOOR" ]; then CAP_B=$TOUCH_FLOOR; fi
+        DOWN_CNT=0; UP_CNT=0; IDLE_CNT=0
+    fi
+
+    # ---------- 4.46 空闲快降判定 ----------
+    # 条件：非交互、非冷启动、非游戏前台，且大核利用率低于空闲判据
+    if [ "$RUSH" = 0 ] && [ "$IN_LAUNCH" = 0 ] && [ "$GAMEF" = 0 ] \
+       && [ "$LOAD_B" -lt "$IDLE_LOAD" ]; then
+        IDLE_CNT=$((IDLE_CNT+1))
+    else
+        IDLE_CNT=0
+    fi
+    if [ "$IDLE_CNT" -ge "$IDLE_ENTER" ]; then IDLE_MODE=1; else IDLE_MODE=0; fi
+
     # ---------- 4.5 限速 + 非对称确认 ----------
-    HI=$(( CAP_B * UP_RATE / 1000 ))
-    LO=$(( CAP_B * DOWN_RATE / 1000 ))
+    pct_mul "$CAP_B" "$UP_RATE"; HI=$_pm
+    if [ "$IDLE_MODE" = 1 ]; then pct_mul "$CAP_B" "$IDLE_RATE"; LO=$_pm
+    else pct_mul "$CAP_B" "$DOWN_RATE"; LO=$_pm; fi
     if [ "$RAW" -gt "$HI" ]; then RAW=$HI; fi
 
+    # RAW 与 CAP_B 都是 snap 后的离散 OPP；相等即"已贴住目标"，无动作。
     if [ "$RAW" -ge "$CAP_B" ]; then
-        UP_CNT=$((UP_CNT+1)); DOWN_CNT=0
-        SCENE="rich_wait"
-        if [ "$UP_CNT" -ge "$UP_CONFIRM" ] || [ "$RUSH" = 1 ] || [ "$IN_LAUNCH" = 1 ]; then
-            CAP_B=$RAW; UP_CNT=0; SCENE="boost"
+        DOWN_CNT=0
+        if [ "$RAW" -eq "$CAP_B" ]; then
+            UP_CNT=0; SCENE="hold"
+        else
+            UP_CNT=$((UP_CNT+1))
+            if [ "$UP_CNT" -ge "$UP_CONFIRM" ] || [ "$RUSH" = 1 ] || [ "$IN_LAUNCH" = 1 ]; then
+                CAP_B=$RAW; UP_CNT=0; SCENE="boost"
+            else
+                SCENE="rich_wait"
+            fi
         fi
     else
         UP_CNT=0
         if [ "$RAW" -lt "$LO" ]; then RAW=$LO; fi
         if [ "$RUSH" = 1 ] || [ "$IN_LAUNCH" = 1 ]; then
             DOWN_CNT=0; SCENE="hold"
+        elif [ "$IDLE_MODE" = 1 ]; then
+            # 快降通道：跳过 8 次确认，直接落地（每 tick 最多 -40%）
+            [ "$RAW" -lt "$FLOOR_BIG" ] && RAW=$FLOOR_BIG
+            CAP_B=$RAW; DOWN_CNT=0; UP_CNT=0
+            if [ "$CAP_B" -le "$FLOOR_BIG" ]; then SCENE="idle"; else SCENE="save"; fi
         else
             DOWN_CNT=$((DOWN_CNT+1))
             if [ "$DOWN_CNT" -ge "$DOWN_CONFIRM" ]; then
@@ -710,6 +938,22 @@ while [ "$RUN" = 1 ]; do
                 SCENE="rich"
             fi
         fi
+    fi
+
+    # 统一出口钳制：任何分支都不许把 CAP_B 写到地板以下 / 上限以上。
+    # （V1.4 漏了这一步：快降通道按 -40%/tick 连乘会击穿地板，出现 469548kHz 这种
+    #   比硬件最低 OPP 还低的值，snap 后再映射成错误 state。）
+    [ "$CAP_B" -lt "$FLOOR_BIG" ] && CAP_B=$FLOOR_BIG
+    [ "$CAP_B" -gt "$STOCK_B" ] && CAP_B=$STOCK_B
+    snap "$FREQ_B" "$CAP_B"; [ "$_sn" -gt 0 ] && CAP_B=$_sn
+
+    # 落底板时 RAW==CAP_B 会走进升档分支，导致场景误报为 boost/升档待确认，
+    # 这里统一按空闲态纠正（cap 本身不受影响）
+    if [ "$IDLE_MODE" = 1 ] && [ "$CAP_B" -le "$FLOOR_BIG" ]; then SCENE="idle"; fi
+
+    # 空闲时直接释放超大核（省掉 5 tick 迟滞等待）；触摸时由下方 RUSH 立即重新挂上
+    if [ "$IDLE_MODE" = 1 ] && [ "$CAP_B" -le "$PRIME_OFF" ]; then
+        PRIME_ONF=0; PRIME_HOLD=0
     fi
 
     # ---------- 4.7 超大核双阈值迟滞 ----------

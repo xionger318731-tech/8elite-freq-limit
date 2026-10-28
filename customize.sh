@@ -5,7 +5,7 @@ DATA=/data/adb/eta_sched
 BASE=/storage/emulated/0/Android/8elite
 
 ui_print "*******************************"
-ui_print "  8elite限频  V1.3"
+ui_print "  8elite限频  V1.4fix"
 ui_print "  作者：罗霄山"
 ui_print "*******************************"
 
@@ -22,8 +22,8 @@ ui_print "- 启动"
 sh "$DATA/ctl.sh" start 2>/dev/null
 
 ui_print ""
-ui_print "安装完成"
-ui_print "  静止锁 748MHz，需求高时自动抬到官方上限"
-ui_print "  冷启动/交互瞬时抬频，不损失响应"
+ui_print "安装完成（V1.4fix）"
+ui_print "  静止约 1 秒落至 748M 底板（省电），重载直上 3.53G（流畅）"
+ui_print "  触摸/冷启动瞬时抬频，不损失响应"
 ui_print "  打开 WebUI 可切换省电/均衡/流畅"
 ui_print ""

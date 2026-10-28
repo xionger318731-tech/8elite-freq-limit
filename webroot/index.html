@@ -20,7 +20,7 @@ h1{font-size:19px;margin:0 0 4px;font-weight:600}
 .row{display:flex;justify-content:space-between;align-items:center;padding:7px 0}
 .row+.row{border-top:1px solid var(--line)}
 .k{color:var(--dim);font-size:13px}
-.v{font-variant-numeric:tabular-nums;font-weight:500}
+.v{font-variant-numeric:tabular-nums;font-weight:500;transition:color .25s ease}
 .v.good{color:var(--good)} .v.warn{color:var(--warn)} .v.bad{color:var(--bad)}
 .seg{display:flex;gap:6px;margin-top:4px}
 .seg button{flex:1;padding:11px 6px;border-radius:10px;border:1px solid var(--line);
@@ -28,11 +28,17 @@ h1{font-size:19px;margin:0 0 4px;font-weight:600}
 .seg button.on{background:var(--accent);border-color:var(--accent);color:#fff}
 .seg button:active{transform:scale(.97)}
 .btn{width:100%;padding:12px;border-radius:10px;border:1px solid var(--line);
-  background:var(--card2);color:var(--fg);font-size:14px;margin-top:8px}
+  background:var(--card2);color:var(--fg);font-size:14px;margin-top:8px;
+  transition:transform .12s ease, background .2s ease, opacity .2s ease}
 .btn.primary{background:var(--accent);border-color:var(--accent);color:#fff}
-.btn:active{transform:scale(.98)}
+.btn:active{transform:scale(.97)}
+.btn.loading{opacity:.55;pointer-events:none}
+.btn.loading::after{content:'';display:inline-block;width:12px;height:12px;
+  margin-left:8px;vertical-align:-1px;border:2px solid currentColor;
+  border-top-color:transparent;border-radius:50%;animation:spin .7s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
 .hint{font-size:11.5px;color:var(--dim);margin-top:8px;line-height:1.6}
-.badge{display:inline-block;padding:2px 8px;border-radius:6px;font-size:11.5px;font-weight:500}
+.badge{display:inline-block;padding:2px 8px;border-radius:6px;font-size:11.5px;font-weight:500;transition:background .25s ease,color .25s ease}
 .badge.idle{background:rgba(62,207,142,.15);color:var(--good)}
 .badge.boost{background:rgba(245,166,35,.15);color:var(--warn)}
 .badge.rich{background:rgba(77,159,255,.15);color:var(--accent)}
@@ -49,7 +55,7 @@ h1{font-size:19px;margin:0 0 4px;font-weight:600}
 <body>
 
 <h1>8elite限频</h1>
-<div class="sub">V1.3 · 双判据容积伺服 · 静止锁 748MHz</div>
+<div class="sub">V1.4fix · 空闲真落 748M · 重载直上 3.53G</div>
 
 <div class="card">
   <h2>实时状态</h2>
@@ -92,36 +98,51 @@ h1{font-size:19px;margin:0 0 4px;font-weight:600}
   <h2>操作</h2>
   <button class="btn" onclick="act('restart')">重启服务</button>
   <button class="btn" onclick="act('release')">立即归还全部限制</button>
-  <button class="btn" onclick="refresh()">刷新</button>
+  <button class="btn" id="btnRefresh" onclick="refresh()">刷新</button>
 </div>
 
 <div id="toast"></div>
 
 <script>
+/* KernelSU 的 ksu.exec 第三个参数必须是「全局函数名（字符串）」，传函数会导致
+   永远不回调、页面一直转圈（这是本项目 docs/NOTES.md 第四节记录过的坑）。
+   这里只走字符串回调，并对 options 做兼容：优先传对象，失败再传 JSON 字符串。 */
 function ksuExec(command, timeoutMs){
   return new Promise(resolve=>{
+    if(typeof ksu==='undefined' || !ksu || typeof ksu.exec!=='function'){
+      resolve({errno:-1,stdout:'',stderr:'no-bridge'}); return;
+    }
+    const id='__ksucb_'+Math.random().toString(36).slice(2);
+    let done=false;
+    const to=setTimeout(()=>{
+      if(!done){done=true; try{delete window[id];}catch(e){window[id]=undefined;}
+        resolve({errno:-1,stdout:'',stderr:'timeout'});}
+    }, timeoutMs||12000);
+    window[id]=function(errno,stdout,stderr){
+      if(done) return;
+      done=true; clearTimeout(to);
+      try{delete window[id];}catch(e){window[id]=undefined;}
+      resolve({errno:(errno===null||errno===undefined)?0:errno,
+               stdout:stdout||'', stderr:stderr||''});
+    };
     try{
-      if(typeof ksu!=='undefined' && ksu && typeof ksu.exec==='function'){
-        const id='cb_'+Math.random().toString(36).slice(2);
-        let done=false;
-        const to=setTimeout(()=>{if(!done){done=true;resolve({errno:-1,stdout:'',stderr:'timeout'});}}, timeoutMs||12000);
-        window[id]=(errno,stdout,stderr)=>{
-          if(!done){done=true;clearTimeout(to);
-            try{delete window[id];}catch(e){window[id]=undefined;}
-            resolve({errno:errno||0,stdout:stdout||'',stderr:stderr||''});}
-        };
-        ksu.exec(command, JSON.stringify({cwd:'/'}), id);
-      }else{
-        resolve({errno:-1,stdout:'',stderr:'no-bridge'});
+      ksu.exec(command, {cwd:'/'}, id);
+    }catch(e1){
+      try{ ksu.exec(command, JSON.stringify({cwd:'/'}), id); }
+      catch(e2){
+        if(!done){done=true; clearTimeout(to); resolve({errno:-1,stdout:'',stderr:String(e2)});}
       }
-    }catch(e){resolve({errno:-1,stdout:'',stderr:String(e)});}
+    }
   });
 }
 
-const STATE='/storage/emulated/0/Android/8elite/obs/state';
+const STATE='/data/adb/eta_sched/state';
+const STATE_FB='/storage/emulated/0/Android/8elite/obs/state';
 const CFG='/storage/emulated/0/Android/8elite/config.conf';
 const SCRIPT='/data/adb/eta_sched/ctl.sh';
 let busy=false;
+let lastTick=-1, lastTickAt=0;
+const rb=document.getElementById('btnRefresh');
 
 function toast(m,ms){
   const el=document.getElementById('toast');
@@ -146,17 +167,35 @@ const SCENE_MAP={
   boost:['需求逼近·升档','boost'],
   hold:['跟随中','hold'],
   save:['富余·降档省电','rich'],
+  idle:['空闲·已落748M','idle'],
   rich:['需求富余','rich']
 };
 
 async function refresh(){
-  if(busy) return; busy=true;
+  if(busy){ toast('刷新中…'); return; }
+  busy=true;
+  if(rb){ rb.classList.add('loading'); rb.textContent='刷新中'; }
   try{
-    const r=await ksuExec(`cat ${STATE} 2>/dev/null`, 8000);
+    let r=await ksuExec(`cat ${STATE} 2>/dev/null`, 8000);
     if(!r.stdout || !r.stdout.trim()){
-      document.getElementById('svc').textContent='未运行';
-      document.getElementById('svc').className='v bad';
+      // 主路径（root 私有）读不到，退回 emulated 镜像
+      r=await ksuExec(`cat ${STATE_FB} 2>/dev/null`, 8000);
+    }
+    if(!r.stdout || !r.stdout.trim()){
+      /* 读不到 state ≠ 服务没跑：可能是 ksu 桥断了 / 权限 / 冻结。
+         用 ctl.sh status 做二次确认，只有确认「未运行」才报未运行。 */
+      let diag='';
+      if(r.stderr==='no-bridge'){
+        diag='无法调用 root（WebUI 未在 KernelSU 内打开）';
+      }else{
+        const st=await ksuExec(`sh ${SCRIPT} status 2>&1 | grep -m1 守护进程`, 10000);
+        diag=(st.stdout||'').trim();
+      }
+      const svc=document.getElementById('svc');
+      if(/运行中/.test(diag)){ svc.textContent='运行中（状态读取失败）'; svc.className='v warn'; }
+      else { svc.textContent='未运行'; svc.className='v bad'; }
       document.getElementById('scene').innerHTML='—';
+      toast(diag?('状态：'+diag.slice(0,40)):'读取状态失败');
       busy=false; return;
     }
     const kv={};
@@ -164,9 +203,20 @@ async function refresh(){
       const i=ln.indexOf('=');
       if(i>0) kv[ln.slice(0,i).trim()]=ln.slice(i+1).trim();
     }
+    /* 存活判定不能只看 alive=1：daemon 被杀后 state 文件会留在磁盘上，
+       这里用 tick 是否还在推进来判定“真活着”，避免误报运行中。 */
     const svc=document.getElementById('svc');
-    if(kv.alive==='1'){svc.textContent='运行中';svc.className='v good';}
-    else{svc.textContent='已停止';svc.className='v bad';}
+    const tk=parseInt(kv.tick||'-1',10);
+    const nowMs=Date.now();
+    if(tk>=0 && tk!==lastTick){ lastTick=tk; lastTickAt=nowMs; }
+    const stalled = (lastTick>=0 && lastTickAt>0 && (nowMs-lastTickAt)>20000);
+    if(kv.alive==='1' && !stalled){
+      svc.textContent='运行中'; svc.className='v good';
+    }else if(stalled){
+      svc.textContent='状态停滞'; svc.className='v bad';
+    }else{
+      svc.textContent='已停止'; svc.className='v bad';
+    }
 
     const sc=SCENE_MAP[kv.scene]||[kv.scene||'—','hold'];
     document.getElementById('scene').innerHTML='<span class="badge '+sc[1]+'">'+sc[0]+'</span>';
@@ -203,7 +253,10 @@ async function refresh(){
   }catch(e){
     document.getElementById('svc').textContent='读取异常';
     document.getElementById('svc').className='v bad';
-  }finally{ busy=false; }
+  }finally{
+    busy=false;
+    if(rb){ rb.classList.remove('loading'); rb.textContent='刷新'; }
+  }
 }
 
 async function setStyle(s){

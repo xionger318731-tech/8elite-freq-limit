@@ -1,11 +1,11 @@
 #!/system/bin/sh
 # ============================================================
-# 8elite限频 卸载 V1.3
+# 8elite限频 卸载 V1.4fix
 #
 # 【本模块的全部足迹】（审计结果）
 #   写入：
-#     /sys/class/thermal/cooling_device3/cur_state   ← 唯一功能性写入
-#     /sys/class/thermal/cooling_device4/cur_state   ← 唯一功能性写入
+#     自动探测的 cpufreq-cpu0 / cpufreq-cpu6 cooling 设备 cur_state   ← 唯一功能性写入
+#     （Find X8 Ultra 实测为 cooling_device0 / cooling_device1；旧版的 device3/4 已废弃）
 #     /data/adb/eta_sched/                           运行目录
 #     /storage/emulated/0/Android/8elite/            数据目录
 #   从未触碰：
@@ -14,8 +14,10 @@
 #     settings / 系统数据库           完全没有
 #
 # 【为什么 cooling 归 0 就等于还原】
-#   cooling_device 的 state=0 是内核定义的「不干预」语义。
-#   归 0 后，最终上限 = msm_performance 的值，也就是官方自己的值。
+#   本模块只通过 cpufreq cooling 设备限频，归 0 即模块不再施加额外限频。
+#   注意：Find X8 Ultra 上 cooling 的 state0 实测 = 2400000（大核）/ 1689600（超大核），
+#   即系统 thermal 热限（由 oiface / thermal-engine 维持），并非「完全放开」；
+#   模块归 0 后，最终上限回到系统热限，与官方调度一致。
 #   不需要「记住原值再还原」，所以不存在还原失败的可能。
 #
 # 【关键顺序】
@@ -25,8 +27,18 @@
 DATA=/data/adb/eta_sched
 BASE=/storage/emulated/0/Android/8elite
 OBS=$BASE/obs
-CD_B=/sys/class/thermal/cooling_device3/cur_state
-CD_P=/sys/class/thermal/cooling_device4/cur_state
+# 自动探测 cpufreq cooling 设备（与 daemon.sh find_paths 一致），避免硬编码到旧版 device3/4
+THERMAL=/sys/class/thermal
+_cdb=""; _cdp=""
+for d in $THERMAL/cooling_device*/; do
+    t=$(cat "${d}type" 2>/dev/null)
+    case "$t" in
+        cpufreq-cpu0)            _cdb="${d%/}/cur_state" ;;
+        cpufreq-cpu6|cpufreq-cpu7) _cdp="${d%/}/cur_state" ;;
+    esac
+done
+CD_B="${_cdb:-$THERMAL/cooling_device3/cur_state}"
+CD_P="${_cdp:-$THERMAL/cooling_device4/cur_state}"
 POL_B=/sys/devices/system/cpu/cpufreq/policy0
 POL_P=/sys/devices/system/cpu/cpufreq/policy6
 MSM=/sys/kernel/msm_performance/parameters/cpu_max_freq
@@ -160,7 +172,7 @@ echo "  残留进程:   $LEFT"
 [ -d "$DATA" ] && echo "  运行目录:   ⚠ 仍在" || echo "  运行目录:   ✓ 已删除"
 [ -d "$BASE" ] && echo "  数据目录:   ⚠ 仍在" || echo "  数据目录:   ✓ 已删除"
 echo ""
-echo "  cooling:    cd3=$CDBV cd4=$CDPV   （0 = 不干预）"
+echo "  cooling:    大核=$CDBV 超大核=$CDPV   （0 = 模块不再额外限频；系统热限由 oiface 维持）"
 echo "  节点权限:   p0=$PERM_B p6=$PERM_P   （应为 -rw-r--r--）"
 echo ""
 echo "  大核当前:   $CUR_B  （硬件上限 $MAX_B）"

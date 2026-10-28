@@ -304,9 +304,85 @@ watchdog: now=$(date +%s)      ← epoch 秒
 WebUI 和 `ctl.sh` 读的全是空值，状态显示一片空白。V1.3 重建了 state 键（`mode` / `style` / `need_big` / `sat_big` / `power` / `target` / `ts` …），
 并让 ctl 与 WebUI 按同一套键对齐。
 
+
 ---
 
-## 九、参考
+## 九、V1.4fix：为什么 WebUI 总说"服务未运行"
+
+### 真根因：守护被系统 cgroup 冻结，不是 WebUI 的问题
+
+现场证据：`ps` 里躺着 **9 个 daemon 实例**，全部 `wchan=do_freezer_trap`，
+`cgroup = /apps/uid_10466/pid_15394`，`cgroup.freeze = 1`。
+
+```
+uid_10466 = me.weishu.kernelsu（KernelSU 管理器）
+```
+
+调用链：
+
+1. WebUI 用 `ksu.exec` 拉起 daemon → 子进程**继承管理器自己的 app cgroup**
+2. 管理器退到后台 → 系统把整个 app cgroup `cgroup.freeze=1`
+3. daemon / watchdog / 触摸协程全部挂起，`state` 停止刷新
+4. watchdog 醒来（它也被冻过）看到 `ts` 落后 >180s → 判定"卡死" → `kill -9`
+5. `ctl.sh start` 重新拉起 → 新进程又落进**同一个冻结域** → 无限循环
+
+`alive=1` 一直写在磁盘上的旧 state 里，所以 WebUI 一会儿显示"运行中"、
+一会儿显示"未运行"，用户看到的就是"状态乱跳"。
+
+### 修法（四层）
+
+| 层 | 做法 |
+|---|---|
+| daemon 启动 | `detach_freeze()` 把自身写进 `/sys/fs/cgroup/cgroup.procs`（cgroup v2 根，init 托管），之后再 fork 的子进程都继承根 |
+| daemon 主循环 | 每 10 tick `self_thaw()`：被系统挪回冻结域就自己挪出来 |
+| watchdog | 先 `is_frozen()` 判 `wchan=do_freezer_trap`，命中就 `thaw()` 而不是 `kill -9`；只有"活着但状态超时"才重启 |
+| ctl.sh | `_launch()` 启动前先 `_detach()`；`do_start` 遇到被冻结的旧 pid 优先解冻；`_reap_dupes()` 清历史遗留 |
+
+### 踩到的次生 bug（都已修）
+
+- **flock 单实例锁不可用**：daemon 会 fork 触摸协程/前台探测，fd 被子进程继承；
+  守护被 `kill -9` 后锁不释放，下次启动永久抢不到锁（实测连拉 7 次全部失败退出）。
+  改用 **pid + `/proc/pid/cmdline` 校验 + 冻结状态** 三重判定。
+- **`/system/bin/sh` 是 32 位算术**：`1555200 × 1500 = 2.33e9` 溢出成负数
+  `-1962167`，导致 `HI`（单 tick 上限）变成负值 → 满载反而降频。
+  所有「频率 × 千分比」改成 `pct_mul()`：先除后乘。
+- **撞顶率溢出**：`SAT_B = (PN-WTOP_B)*1000/d`，阈值随 `CAP_B` 变动时
+  `PN < WTOP_B` 得负值，×1000 后直接爆掉（实测 `sat=30924400‰`）。
+  改为增量裁剪到 `[0, d]`。
+- **场景标签乱跳**：`RAW == CAP_B` 时没有升档动作却标 `rich_wait`，
+  空载时在 boost/rich_wait 之间反复横跳。`RAW==CAP_B` 统一记 `hold`。
+- **地板被击穿**：快降通道按 `-40%/tick` 连乘会算出 `469548kHz`，
+  比硬件最低 OPP 还低。补了出口统一钳制 `[FLOOR_BIG, STOCK_B]` + `snap`。
+- **幽灵触摸的真身**：`touch.ts` 每秒刷新，`RUSH` 永远为 1。
+  原实现 `dd if=/dev/input/eventN bs=16 count=1` 在无操作时立即返回，
+  每次返回都记一次"触摸"。改为用 `/proc/uptime` 前后差判"阻塞读"，
+  读取耗时 < 300ms 视为噪声丢弃。
+
+### map 表：V1.4 提交的两张表是凭空写的
+
+V1.4 的 `map_big.conf` 声称"本机 cooling 只有 3 个有效档、state0-9=2400000、
+748800/556800/384000 纯属虚构"。**逐档实测结果相反**：
+
+```
+state  0..15 → 3072000, 3072000, 3072000, 2918400, 2745600, 2400000,
+                2227200, 1996800, 1785600, 1555200, 1363200, 1152000,
+                 960000,  748800,  556800,  384000
+```
+
+`map_prime.conf` 声称"全部 16 档都是 1689600、无法压低"，实测：
+
+```
+state  0..15 → 3513600, 3513600, 3513600, (3513600), 3513600, 3283200,
+                3072000, 2841600, 2649600, 2438400, 2246400, 1958400,
+                1689600, 1401600, 1209600, 1017600
+```
+
+两张表已按实测重写。**结论：任何 map 表都必须用 `probe.sh` 在本机实测生成，
+不能靠"看起来合理"填。**
+
+---
+
+## 十、参考
 
 - Qualcomm `msm_performance` / `cooling_device` 内核接口
 - Android `time_in_state` 语义
