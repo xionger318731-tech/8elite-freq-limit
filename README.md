@@ -1,4 +1,4 @@
-# 8elite限频
+# 8elite限频（停更）
 
 > 骁龙 8 至尊版（SM8750 / SM8850）动态 CPU 限频模块
 > KernelSU / APatch · 不改调度器 · 卸载零残留
